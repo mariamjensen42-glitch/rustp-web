@@ -5,10 +5,15 @@ use serde::{Deserialize, Serialize};
 pub struct Post {
     pub id: i32,
     pub title: String,
+    pub slug: Option<String>,
     pub content: String,
+    pub excerpt: Option<String>,
     pub author: String,
+    pub status: Option<String>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
     pub category_id: Option<i32>,
     pub user_id: Option<i32>,
     pub summary: Option<String>,
@@ -23,23 +28,31 @@ pub struct Post {
 #[diesel(table_name = crate::schema::posts)]
 pub struct NewPost {
     pub title: String,
+    pub slug: Option<String>,
     pub content: String,
+    pub excerpt: Option<String>,
     pub author: String,
+    pub status: Option<String>,
     pub category_id: Option<i32>,
     pub user_id: Option<i32>,
     pub summary: Option<String>,
     pub cover_image: Option<String>,
-    pub is_published: bool,
-    pub is_top: bool,
-    pub allow_comments: bool,
+    pub is_published: Option<bool>,
+    pub is_top: Option<bool>,
+    pub allow_comments: Option<bool>,
 }
 
 #[derive(AsChangeset, Deserialize)]
 #[diesel(table_name = crate::schema::posts)]
 pub struct UpdatePost {
     pub title: Option<String>,
+    pub slug: Option<String>,
     pub content: Option<String>,
+    pub excerpt: Option<String>,
     pub author: Option<String>,
+    pub status: Option<String>,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
     pub category_id: Option<i32>,
     pub user_id: Option<i32>,
     pub summary: Option<String>,
@@ -89,6 +102,8 @@ pub struct UpdateUser {
 pub struct Category {
     pub id: i32,
     pub name: String,
+    pub slug: Option<String>,
+    pub description: Option<String>,
     pub parent_id: Option<i32>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
@@ -98,6 +113,8 @@ pub struct Category {
 #[diesel(table_name = crate::schema::categories)]
 pub struct NewCategory {
     pub name: String,
+    pub slug: Option<String>,
+    pub description: Option<String>,
     pub parent_id: Option<i32>,
 }
 
@@ -105,6 +122,8 @@ pub struct NewCategory {
 #[diesel(table_name = crate::schema::categories)]
 pub struct UpdateCategory {
     pub name: Option<String>,
+    pub slug: Option<String>,
+    pub description: Option<String>,
     pub parent_id: Option<i32>,
 }
 
@@ -112,6 +131,7 @@ pub struct UpdateCategory {
 pub struct Tag {
     pub id: i32,
     pub name: String,
+    pub slug: Option<String>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -120,12 +140,14 @@ pub struct Tag {
 #[diesel(table_name = crate::schema::tags)]
 pub struct NewTag {
     pub name: String,
+    pub slug: Option<String>,
 }
 
 #[derive(AsChangeset, Deserialize)]
 #[diesel(table_name = crate::schema::tags)]
 pub struct UpdateTag {
     pub name: Option<String>,
+    pub slug: Option<String>,
 }
 
 #[derive(Queryable, Serialize, Deserialize)]
@@ -168,4 +190,25 @@ pub struct UpdateComment {
 pub struct PostTag {
     pub post_id: i32,
     pub tag_id: i32,
+}
+
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct Media {
+    pub id: i32,
+    pub filename: String,
+    pub filepath: String,
+    pub mimetype: String,
+    pub size: i64,
+    pub uploaded_by: Option<i32>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::media)]
+pub struct NewMedia {
+    pub filename: String,
+    pub filepath: String,
+    pub mimetype: String,
+    pub size: i64,
+    pub uploaded_by: Option<i32>,
 }
