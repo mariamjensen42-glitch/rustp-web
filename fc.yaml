@@ -1,0 +1,33 @@
+version: 3.0
+name: blog-api-service
+description: Blog API Service
+type: http
+region: cn-hangzhou
+runtime: custom
+build:
+  command: "cargo build --release"
+  cwd: "."
+  env:
+    - key: "RUSTFLAGS"
+      value: "--release"
+deploy:
+  codeUri: "."
+  description: "Blog API Service"
+  functionName: "blog-api-function"
+  handler: "target/release/blog-api"
+  memorySize: 512
+  runtime: "custom"
+  timeout: 30
+  environmentVariables:
+    - key: "RUST_BACKTRACE"
+      value: "1"
+  triggers:
+    - name: "httpTrigger"
+      type: "http"
+      config:
+        authType: "anonymous"
+        methods:
+          - "GET"
+          - "POST"
+          - "PUT"
+          - "DELETE"
