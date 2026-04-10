@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse, Responder, HttpRequest};
+use actix_web::{web, HttpResponse, Responder};
 use diesel::prelude::*;
 use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, db::establish_connection, auth::{generate_token, hash_password, verify_password}};
 
