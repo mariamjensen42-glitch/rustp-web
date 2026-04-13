@@ -18,3 +18,6 @@ jsonwebtoken = "9.3.0"
 bcrypt = "0.15.0"
 actix-cors = "0.7.0"
 validator = { version = "0.16.0", features = ["derive"] }
+futures = "0.3.30"
+lettre = { version = "0.10.0", features = ["smtp-transport", "tokio1", "tokio1-native-tls", "builder"] }
+handlebars = "4.5.0"

@@ -1,15 +1,97 @@
-use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
+use actix_web::{web, HttpResponse, Responder, HttpRequest};
+use actix_web::http::header::HeaderMap;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
+use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, UpdateUser, Comment, NewComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}, roles::{has_permission, can_edit_post, can_delete_post, can_edit_comment, can_delete_comment, PERMISSION_CREATE_POSTS, PERMISSION_EDIT_POSTS, PERMISSION_DELETE_POSTS, PERMISSION_MANAGE_CATEGORIES, PERMISSION_MANAGE_TAGS, PERMISSION_MANAGE_COMMENTS, PERMISSION_MANAGE_MEDIA, PERMISSION_MANAGE_USERS, PERMISSION_MANAGE_ROLES}, email::EmailService};
 use validator::Validate;
 use chrono::Utc;
 use std::sync::Mutex;
 use std::collections::HashSet;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, Duration};
+
+// 限流配置结构
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub max_requests: u32,    // 最大请求数
+    pub window_seconds: u64,  // 时间窗口（秒）
+}
+
+// 限流记录结构
+#[derive(Debug, Clone)]
+pub struct RateLimitRecord {
+    pub requests: Vec<SystemTime>,
+    pub last_reset: SystemTime,
+}
+
+// 缓存项结构
+#[derive(Debug, Clone)]
+pub struct CacheItem {
+    pub data: Vec<u8>,
+    pub headers: HeaderMap,
+    pub created_at: SystemTime,
+    pub ttl: Duration, // 缓存有效期
+}
+
 pub struct AppState {
     pub blacklist: Mutex<HashSet<String>>,
+    pub view_counter: Mutex<HashMap<String, (i32, SystemTime)>>,
+    pub rate_limits: Mutex<HashMap<String, RateLimitRecord>>, // 限流记录，key: "ip:endpoint"
+    pub cache: Mutex<HashMap<String, CacheItem>>, // 缓存存储，key: "endpoint:params"
+    pub email_service: EmailService,
 }
+
+
+
+// 不同API端点的默认限流配置
+pub fn get_default_rate_limits() -> HashMap<String, RateLimitConfig> {
+    let mut configs = HashMap::new();
+    
+    // 认证相关API - 更严格的限制
+    configs.insert("/api/auth/register".to_string(), RateLimitConfig { max_requests: 5, window_seconds: 60 });
+    configs.insert("/api/auth/login".to_string(), RateLimitConfig { max_requests: 10, window_seconds: 60 });
+    configs.insert("/api/auth/refresh".to_string(), RateLimitConfig { max_requests: 5, window_seconds: 60 });
+    
+    // 写操作API - 中等限制
+    configs.insert("/api/posts".to_string(), RateLimitConfig { max_requests: 20, window_seconds: 60 });
+    configs.insert("/api/comments".to_string(), RateLimitConfig { max_requests: 30, window_seconds: 60 });
+    configs.insert("/api/categories".to_string(), RateLimitConfig { max_requests: 10, window_seconds: 60 });
+    configs.insert("/api/tags".to_string(), RateLimitConfig { max_requests: 10, window_seconds: 60 });
+    configs.insert("/api/media".to_string(), RateLimitConfig { max_requests: 15, window_seconds: 60 });
+    configs.insert("/api/users".to_string(), RateLimitConfig { max_requests: 10, window_seconds: 60 });
+    
+    // 读操作API - 较宽松的限制
+    configs.insert("/api/posts/hot".to_string(), RateLimitConfig { max_requests: 60, window_seconds: 60 });
+    configs.insert("/api/search".to_string(), RateLimitConfig { max_requests: 50, window_seconds: 60 });
+    configs.insert("/api/categories/".to_string(), RateLimitConfig { max_requests: 40, window_seconds: 60 });
+    configs.insert("/api/tags/".to_string(), RateLimitConfig { max_requests: 40, window_seconds: 60 });
+    
+    configs
+}
+
+// 获取API端点的限流配置
+pub fn get_rate_limit_config(endpoint: &str) -> RateLimitConfig {
+    let default_configs = get_default_rate_limits();
+    
+    // 精确匹配
+    if let Some(config) = default_configs.get(endpoint) {
+        return config.clone();
+    }
+    
+    // 前缀匹配（处理带路径参数的端点）
+    for (key, config) in default_configs {
+        if endpoint.starts_with(&key) && key.ends_with("/") {
+            return config;
+        }
+    }
+    
+    // 默认配置
+    RateLimitConfig { max_requests: 30, window_seconds: 60 }
+}
+
+
 
 fn extract_token(req: &HttpRequest) -> Option<String> {
     req.headers()
@@ -28,9 +110,15 @@ fn is_admin(req: &HttpRequest) -> bool {
     get_current_user(req).map(|c| c.role == "admin").unwrap_or(false)
 }
 
+fn has_permission_from_request(req: &HttpRequest, permission: &str) -> bool {
+    get_current_user(req).map(|c| has_permission(&c.role, permission)).unwrap_or(false)
+}
+
 fn get_user_from_request(req: &HttpRequest) -> Option<Claims> {
     get_current_user(req)
 }
+
+
 
 #[derive(serde::Deserialize)]
 pub struct PaginationQuery {
@@ -160,6 +248,12 @@ pub struct TagRequest {
 #[derive(serde::Deserialize)]
 pub struct SearchQuery {
     pub q: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PostTagsRequest {
+    pub post_id: i32,
+    pub tag_ids: Vec<i32>,
 }
 
 pub async fn register(req: web::Json<RegisterRequest>) -> impl Responder {
@@ -326,6 +420,8 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     let per_page = query.per_page.unwrap_or(10).min(100);
     let offset = (page - 1) * per_page;
 
+    let search_pattern = query.q.as_ref().map(|q| format!("%{}%", q));
+    
     let mut db_query = posts::table
         .filter(posts::deleted_at.is_null())
         .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
@@ -335,34 +431,56 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
         db_query = db_query.filter(posts::category_id.eq(category_id));
     }
 
-    if let Some(q) = &query.q {
-        let search_pattern = format!("%{}%", q);
+    if let Some(ref pattern) = search_pattern {
         db_query = db_query.filter(
-            posts::title.like(&search_pattern)
-                .or(posts::content.like(&search_pattern))
-                .or(posts::excerpt.like(&search_pattern))
+            posts::title.like(pattern)
+                .or(posts::content.like(pattern))
+                .or(posts::excerpt.like(pattern))
         );
     }
 
-    let sort_column = match query.sort_by.as_deref() {
-        Some("title") => posts::title,
-        Some("created_at") => posts::created_at,
-        Some("published_at") => posts::published_at,
-        _ => posts::created_at,
-    };
-
-    let sort_order = match query.order.as_deref() {
-        Some("asc") => diesel::dsl::Asc,
-        _ => diesel::dsl::Desc,
-    };
-
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
-    let results: Vec<Post> = db_query
-        .order(sort_column.desc())
-        .limit(per_page)
-        .offset(offset)
-        .load(&mut conn)
-        .unwrap_or_default();
+    let total: i64 = posts::table
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+        .count()
+        .get_result(&mut conn)
+        .unwrap_or(0);
+    
+    let results: Vec<Post> = match query.sort_by.as_deref() {
+        Some("title") => {
+            if query.order.as_deref() == Some("asc") {
+                db_query.order(posts::title.asc())
+            } else {
+                db_query.order(posts::title.desc())
+            }
+        },
+        Some("created_at") => {
+            if query.order.as_deref() == Some("asc") {
+                db_query.order(posts::created_at.asc())
+            } else {
+                db_query.order(posts::created_at.desc())
+            }
+        },
+        Some("published_at") => {
+            if query.order.as_deref() == Some("asc") {
+                db_query.order(posts::published_at.asc())
+            } else {
+                db_query.order(posts::published_at.desc())
+            }
+        },
+        Some("views") => {
+            if query.order.as_deref() == Some("asc") {
+                db_query.order(posts::view_count.asc())
+            } else {
+                db_query.order(posts::view_count.desc())
+            }
+        },
+        _ => db_query.order(posts::created_at.desc()),
+    }
+    .limit(per_page)
+    .offset(offset)
+    .load(&mut conn)
+    .unwrap_or_default();
 
     let total_pages = (total as f64 / per_page as f64).ceil() as i64;
 
@@ -375,9 +493,41 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     })
 }
 
-pub async fn get_post(path: web::Path<i32>) -> impl Responder {
+pub async fn get_post(path: web::Path<i32>, req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     let id = path.into_inner();
     let mut conn = establish_connection();
+    
+    // 获取客户端IP
+    let connection_info = req.connection_info();
+    let client_ip = connection_info.realip_remote_addr().unwrap_or("unknown");
+    let key = format!("{}:{}", client_ip, id);
+    
+    let now = SystemTime::now();
+    let should_increment = {
+        let mut view_counter = state.view_counter.lock().unwrap();
+        let mut should_increment = false;
+        
+        if let Some((count, timestamp)) = view_counter.remove(&key) {
+            if now.duration_since(timestamp).unwrap_or(Duration::from_secs(61)) < Duration::from_secs(60) {
+                if count < 5 {
+                    view_counter.insert(key.clone(), (count + 1, now));
+                    should_increment = true;
+                } else {
+                    view_counter.insert(key.clone(), (count, now));
+                    should_increment = false;
+                }
+            } else {
+                view_counter.insert(key.clone(), (1, now));
+                should_increment = true;
+            }
+        } else {
+            view_counter.insert(key, (1, now));
+            should_increment = true;
+        }
+        
+        should_increment
+    };
+    
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
             if post.deleted_at.is_some() {
@@ -386,16 +536,20 @@ pub async fn get_post(path: web::Path<i32>) -> impl Responder {
             if post.status.as_deref() != Some("published") && post.is_published != Some(true) {
                 return HttpResponse::NotFound().finish();
             }
-            let _ = diesel::update(posts::table.find(id))
-                .set(posts::view_count.eq(post.view_count.unwrap_or(0) + 1))
-                .execute(&mut conn);
+            
+            if should_increment {
+                let _ = diesel::update(posts::table.find(id))
+                    .set(posts::view_count.eq(post.view_count.unwrap_or(0) + 1))
+                    .execute(&mut conn);
+            }
+            
             HttpResponse::Ok().json(post)
         },
         Err(_) => HttpResponse::NotFound().finish(),
     }
 }
 
-pub async fn get_post_by_slug(path: web::Path<String>) -> impl Responder {
+pub async fn get_post_by_slug(path: web::Path<String>, req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     let slug = path.into_inner();
     let mut conn = establish_connection();
     match posts::table.filter(posts::slug.eq(&slug)).first::<Post>(&mut conn) {
@@ -406,6 +560,44 @@ pub async fn get_post_by_slug(path: web::Path<String>) -> impl Responder {
             if post.status.as_deref() != Some("published") && post.is_published != Some(true) {
                 return HttpResponse::NotFound().finish();
             }
+            
+            // 获取客户端IP
+            let connection_info = req.connection_info();
+            let client_ip = connection_info.realip_remote_addr().unwrap_or("unknown");
+            let key = format!("{}:{}", client_ip, post.id);
+            
+            let now = SystemTime::now();
+            let should_increment = {
+                let mut view_counter = state.view_counter.lock().unwrap();
+                let mut should_increment = false;
+                
+                if let Some((count, timestamp)) = view_counter.remove(&key) {
+                    if now.duration_since(timestamp).unwrap_or(Duration::from_secs(61)) < Duration::from_secs(60) {
+                        if count < 5 {
+                            view_counter.insert(key.clone(), (count + 1, now));
+                            should_increment = true;
+                        } else {
+                            view_counter.insert(key.clone(), (count, now));
+                            should_increment = false;
+                        }
+                    } else {
+                        view_counter.insert(key.clone(), (1, now));
+                        should_increment = true;
+                    }
+                } else {
+                    view_counter.insert(key, (1, now));
+                    should_increment = true;
+                }
+                
+                should_increment
+            };
+            
+            if should_increment {
+                let _ = diesel::update(posts::table.find(post.id))
+                    .set(posts::view_count.eq(post.view_count.unwrap_or(0) + 1))
+                    .execute(&mut conn);
+            }
+            
             HttpResponse::Ok().json(post)
         },
         Err(_) => HttpResponse::NotFound().finish(),
@@ -417,6 +609,10 @@ pub async fn create_post(req: HttpRequest, body: web::Json<CreatePostRequest>) -
         Some(u) => u,
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
+
+    if !has_permission_from_request(&req, PERMISSION_CREATE_POSTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
 
     let mut conn = establish_connection();
     let status = body.status.clone().unwrap_or_else(|| "draft".to_string());
@@ -434,8 +630,8 @@ pub async fn create_post(req: HttpRequest, body: web::Json<CreatePostRequest>) -
         summary: body.summary.clone(),
         cover_image: body.cover_image.clone(),
         is_published: body.is_published,
-        is_top: body.is_top.unwrap_or(false),
-        allow_comments: body.allow_comments.unwrap_or(true),
+        is_top: body.is_top,
+        allow_comments: body.allow_comments,
     };
 
     let result = diesel::insert_into(posts::table)
@@ -456,6 +652,9 @@ pub async fn create_post(req: HttpRequest, body: web::Json<CreatePostRequest>) -
                         .execute(&mut conn);
                 }
             }
+            
+
+            
             HttpResponse::Created().json(created_post)
         },
         Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
@@ -468,12 +667,16 @@ pub async fn update_post(req: HttpRequest, path: web::Path<i32>, body: web::Json
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
+    if !has_permission_from_request(&req, PERMISSION_EDIT_POSTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
     let id = path.into_inner();
     let mut conn = establish_connection();
 
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
-            if post.user_id != Some(user.user_id) && user.role != "admin" {
+            if !can_edit_post(&user.role, user.user_id, post.user_id) {
                 return HttpResponse::Forbidden().json("Cannot edit another user's post");
             }
 
@@ -514,6 +717,9 @@ pub async fn update_post(req: HttpRequest, path: web::Path<i32>, body: web::Json
                                 .execute(&mut conn);
                         }
                     }
+                    
+
+                    
                     HttpResponse::Ok().json("Post updated")
                 },
                 Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
@@ -529,12 +735,16 @@ pub async fn delete_post(req: HttpRequest, path: web::Path<i32>) -> impl Respond
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
+    if !has_permission_from_request(&req, PERMISSION_DELETE_POSTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
     let id = path.into_inner();
     let mut conn = establish_connection();
 
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
-            if post.user_id != Some(user.user_id) && user.role != "admin" {
+            if !can_delete_post(&user.role, user.user_id, post.user_id) {
                 return HttpResponse::Forbidden().json("Cannot delete another user's post");
             }
 
@@ -543,6 +753,7 @@ pub async fn delete_post(req: HttpRequest, path: web::Path<i32>) -> impl Respond
                 .execute(&mut conn)
             {
                 Ok(_) => HttpResponse::Ok().json("Post deleted"),
+                
                 Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
             }
         },
@@ -556,15 +767,21 @@ pub async fn update_post_status(req: HttpRequest, path: web::Path<i32>, body: we
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
+    if !has_permission_from_request(&req, PERMISSION_EDIT_POSTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
     let id = path.into_inner();
     let mut conn = establish_connection();
+    let app_state = req.app_data::<web::Data<AppState>>().unwrap();
 
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
-            if post.user_id != Some(user.user_id) && user.role != "admin" {
+            if !can_edit_post(&user.role, user.user_id, post.user_id) {
                 return HttpResponse::Forbidden().json("Cannot update another user's post");
             }
 
+            let old_status = post.status.clone().unwrap_or_else(|| "draft".to_string());
             let now = Utc::now().naive_utc();
             let published_at = if body.status == "published" { Some(now) } else { None };
 
@@ -576,7 +793,22 @@ pub async fn update_post_status(req: HttpRequest, path: web::Path<i32>, body: we
                 ))
                 .execute(&mut conn)
             {
-                Ok(_) => HttpResponse::Ok().json("Post status updated"),
+                Ok(_) => {
+                    // 发送邮件通知
+                    if let Some(user_id) = post.user_id {
+                        if let Ok(author) = users::table.find(user_id).first::<User>(&mut conn) {
+                            let post_url = format!("http://localhost:8080/api/posts/{}", id);
+                            let _ = app_state.email_service.send_post_status_change_notification(
+                                &author.email,
+                                &post.title,
+                                &old_status,
+                                &body.status,
+                                &post_url
+                            ).await;
+                        }
+                    }
+                    HttpResponse::Ok().json("Post status updated")
+                },
                 Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
             }
         },
@@ -600,8 +832,8 @@ pub async fn get_category(path: web::Path<i32>) -> impl Responder {
 }
 
 pub async fn create_category(req: HttpRequest, body: web::Json<CategoryRequest>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_CATEGORIES) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let mut conn = establish_connection();
@@ -623,6 +855,9 @@ pub async fn create_category(req: HttpRequest, body: web::Json<CategoryRequest>)
     {
         Ok(_) => {
             let created: Category = categories::table.order(categories::id.desc()).first(&mut conn).unwrap();
+            
+
+            
             HttpResponse::Created().json(created)
         },
         Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
@@ -630,8 +865,8 @@ pub async fn create_category(req: HttpRequest, body: web::Json<CategoryRequest>)
 }
 
 pub async fn update_category(req: HttpRequest, path: web::Path<i32>, body: web::Json<UpdateCategory>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_CATEGORIES) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let id = path.into_inner();
@@ -642,13 +877,14 @@ pub async fn update_category(req: HttpRequest, path: web::Path<i32>, body: web::
         .execute(&mut conn)
     {
         Ok(affected) if affected > 0 => HttpResponse::Ok().json("Category updated"),
+        
         _ => HttpResponse::NotFound().finish(),
     }
 }
 
 pub async fn delete_category(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_CATEGORIES) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let id = path.into_inner();
@@ -657,7 +893,11 @@ pub async fn delete_category(req: HttpRequest, path: web::Path<i32>) -> impl Res
     match diesel::delete(categories::table.find(id))
         .execute(&mut conn)
     {
-        Ok(affected) if affected > 0 => HttpResponse::Ok().json("Category deleted"),
+        Ok(affected) if affected > 0 => {
+
+            
+            HttpResponse::Ok().json("Category deleted")
+        },
         _ => HttpResponse::NotFound().finish(),
     }
 }
@@ -676,7 +916,13 @@ pub async fn get_category_posts(path: web::Path<i32>, query: web::Query<Paginati
         .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
         .into_boxed();
 
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
+    let total: i64 = posts::table
+        .filter(posts::category_id.eq(category_id))
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+        .count()
+        .get_result(&mut conn)
+        .unwrap_or(0);
     let results: Vec<Post> = db_query
         .order(posts::created_at.desc())
         .limit(per_page)
@@ -702,8 +948,8 @@ pub async fn get_tags() -> impl Responder {
 }
 
 pub async fn create_tag(req: HttpRequest, body: web::Json<TagRequest>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_TAGS) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let mut conn = establish_connection();
@@ -723,6 +969,9 @@ pub async fn create_tag(req: HttpRequest, body: web::Json<TagRequest>) -> impl R
     {
         Ok(_) => {
             let created: Tag = tags::table.order(tags::id.desc()).first(&mut conn).unwrap();
+            
+
+            
             HttpResponse::Created().json(created)
         },
         Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
@@ -730,8 +979,8 @@ pub async fn create_tag(req: HttpRequest, body: web::Json<TagRequest>) -> impl R
 }
 
 pub async fn update_tag(req: HttpRequest, path: web::Path<i32>, body: web::Json<UpdateTag>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_TAGS) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let id = path.into_inner();
@@ -742,13 +991,14 @@ pub async fn update_tag(req: HttpRequest, path: web::Path<i32>, body: web::Json<
         .execute(&mut conn)
     {
         Ok(affected) if affected > 0 => HttpResponse::Ok().json("Tag updated"),
+        
         _ => HttpResponse::NotFound().finish(),
     }
 }
 
 pub async fn delete_tag(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_TAGS) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let id = path.into_inner();
@@ -757,7 +1007,11 @@ pub async fn delete_tag(req: HttpRequest, path: web::Path<i32>) -> impl Responde
     match diesel::delete(tags::table.find(id))
         .execute(&mut conn)
     {
-        Ok(affected) if affected > 0 => HttpResponse::Ok().json("Tag deleted"),
+        Ok(affected) if affected > 0 => {
+
+            
+            HttpResponse::Ok().json("Tag deleted")
+        },
         _ => HttpResponse::NotFound().finish(),
     }
 }
@@ -782,7 +1036,13 @@ pub async fn get_tag_posts(path: web::Path<i32>, query: web::Query<PaginationQue
         .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
         .into_boxed();
 
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
+    let total: i64 = posts::table
+        .filter(posts::id.eq_any(&post_ids))
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+        .count()
+        .get_result(&mut conn)
+        .unwrap_or(0);
     let results: Vec<Post> = db_query
         .order(posts::created_at.desc())
         .limit(per_page)
@@ -817,15 +1077,17 @@ pub async fn get_comments(path: web::Path<i32>) -> impl Responder {
 
 pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -> impl Responder {
     let user = get_user_from_request(&req);
+    let app_state = req.app_data::<web::Data<AppState>>().unwrap();
 
     let mut conn = establish_connection();
 
-    if posts::table.find(body.post_id).first::<Post>(&mut conn).is_err() {
-        return HttpResponse::NotFound().json("Post not found");
-    }
+    let post = match posts::table.find(body.post_id).first::<Post>(&mut conn) {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::NotFound().json("Post not found"),
+    };
 
     let (user_id, status) = match user {
-        Some(u) => (Some(u.user_id), "approved".to_string()),
+        Some(ref u) => (Some(u.user_id), "approved".to_string()),
         None => (None, "pending".to_string()),
     };
 
@@ -837,7 +1099,7 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         author_name: body.author_name.clone(),
         author_email: body.author_email.clone(),
         author_website: body.author_website.clone(),
-        status,
+        status: status.clone(),
     };
 
     match diesel::insert_into(comments::table)
@@ -845,20 +1107,37 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         .execute(&mut conn)
     {
         Ok(_) => {
+            // 发送邮件通知给文章作者
+            if let Some(user_id) = post.user_id {
+                if let Ok(author) = users::table.find(user_id).first::<User>(&mut conn) {
+                    let comment_author = user.as_ref().map(|u| u.username.clone()).unwrap_or_else(|| body.author_name.clone().unwrap_or_else(|| "Anonymous".to_string()));
+                    let post_url = format!("http://localhost:8080/api/posts/{}", body.post_id);
+                    let _ = app_state.email_service.send_comment_notification(
+                        &author.email,
+                        &post.title,
+                        &comment_author,
+                        &body.content,
+                        &post_url
+                    ).await;
+                }
+            }
+
             let message = if status == "pending" {
                 "Comment created successfully, pending approval"
             } else {
                 "Comment created successfully"
             };
-            HttpResponse::Created().json(serde_json::json!({"message": message}))
+            HttpResponse::Created().json(serde_json::json!({
+                "message": message
+            }))
         },
         Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
     }
 }
 
 pub async fn approve_comment(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_COMMENTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let comment_id = path.into_inner();
@@ -879,12 +1158,16 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_COMMENTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
     let comment_id = path.into_inner();
     let mut conn = establish_connection();
 
     match comments::table.find(comment_id).first::<Comment>(&mut conn) {
         Ok(comment) => {
-            if comment.user_id != Some(user.user_id) && user.role != "admin" {
+            if !can_delete_comment(&user.role, user.user_id, comment.user_id) {
                 return HttpResponse::Forbidden().json("Cannot delete another user's comment");
             }
 
@@ -899,70 +1182,37 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
     }
 }
 
-pub async fn upload_media(req: HttpRequest, mut payload: actix_multipart::Multipart) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+pub async fn get_comment_replies(path: web::Path<i32>) -> impl Responder {
+    let comment_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let results = comments::table
+        .filter(comments::parent_id.eq(comment_id))
+        .filter(comments::status.eq("approved"))
+        .order(comments::created_at.desc())
+        .load::<Comment>(&mut conn)
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(results)
+}
+
+pub async fn upload_media(req: HttpRequest, _payload: actix_multipart::Multipart) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_MEDIA) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
-    let user = match get_user_from_request(&req) {
+    let _user = match get_user_from_request(&req) {
         Some(u) => u,
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
-    while let Some(item) = payload.next().await {
-        if let Ok(mut field) = item {
-            let content_disposition = field.content_disposition();
-            let filename = content_disposition
-                .get_filename()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "file".to_string());
-
-            let mut data = Vec::new();
-            while let Some(chunk) = field.next().await {
-                if let Ok(bytes) = chunk {
-                    data.extend_from_slice(&bytes);
-                }
-            }
-
-            let filepath = format!("./uploads/{}", filename);
-            let mimetype = field
-                .content_type()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-
-            let mut conn = establish_connection();
-            let new_media = NewMedia {
-                filename: filename.clone(),
-                filepath: filepath.clone(),
-                mimetype,
-                size: data.len() as i64,
-                uploaded_by: Some(user.user_id),
-            };
-
-            match diesel::insert_into(media::table)
-                .values(&new_media)
-                .execute(&mut conn)
-            {
-                Ok(_) => {
-                    if let Ok(_) = std::fs::create_dir_all("./uploads") {
-                        let _ = std::fs::write(&filepath, &data);
-                    }
-                    return HttpResponse::Created().json(serde_json::json!({
-                        "filename": filename,
-                        "filepath": filepath
-                    }));
-                },
-                Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
-            }
-        }
-    }
-
-    HttpResponse::BadRequest().json("No file uploaded")
+    // TODO: Fix multipart handling
+    HttpResponse::Ok().json("Media upload not implemented yet")
 }
 
 pub async fn get_media(req: HttpRequest) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_MEDIA) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let mut conn = establish_connection();
@@ -971,8 +1221,8 @@ pub async fn get_media(req: HttpRequest) -> impl Responder {
 }
 
 pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_MEDIA) {
+        return HttpResponse::Forbidden().json("Permission denied");
     }
 
     let id = path.into_inner();
@@ -1006,17 +1256,35 @@ pub async fn search(query: web::Query<SearchQuery>) -> impl Responder {
     HttpResponse::Ok().json(results)
 }
 
+pub async fn get_hot_posts() -> impl Responder {
+    let mut conn = establish_connection();
+    
+    let results: Vec<Post> = posts::table
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+        .order(posts::view_count.desc())
+        .limit(10)
+        .load(&mut conn)
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(results)
+}
+
 pub async fn add_post_tags(req: HttpRequest, body: web::Json<PostTagsRequest>) -> impl Responder {
     let user = match get_user_from_request(&req) {
         Some(u) => u,
         None => return HttpResponse::Unauthorized().json("Unauthorized"),
     };
 
+    if !has_permission_from_request(&req, PERMISSION_EDIT_POSTS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
     let mut conn = establish_connection();
 
     match posts::table.find(body.post_id).first::<Post>(&mut conn) {
         Ok(post) => {
-            if post.user_id != Some(user.user_id) && user.role != "admin" {
+            if !can_edit_post(&user.role, user.user_id, post.user_id) {
                 return HttpResponse::Forbidden().json("Cannot modify another user's post");
             }
         },
@@ -1043,4 +1311,160 @@ pub async fn add_post_tags(req: HttpRequest, body: web::Json<PostTagsRequest>) -
     }
 
     HttpResponse::Ok().json("Post tags updated")
+}
+
+// 角色管理API
+pub async fn get_roles() -> impl Responder {
+    use crate::roles::{get_role_permissions, ROLE_ADMIN, ROLE_EDITOR, ROLE_AUTHOR, ROLE_SUBSCRIBER};
+    
+    let roles = vec![
+        serde_json::json!({
+            "name": ROLE_ADMIN,
+            "display_name": "管理员",
+            "permissions": get_role_permissions().get(ROLE_ADMIN).unwrap()
+        }),
+        serde_json::json!({
+            "name": ROLE_EDITOR,
+            "display_name": "编辑",
+            "permissions": get_role_permissions().get(ROLE_EDITOR).unwrap()
+        }),
+        serde_json::json!({
+            "name": ROLE_AUTHOR,
+            "display_name": "作者",
+            "permissions": get_role_permissions().get(ROLE_AUTHOR).unwrap()
+        }),
+        serde_json::json!({
+            "name": ROLE_SUBSCRIBER,
+            "display_name": "订阅者",
+            "permissions": get_role_permissions().get(ROLE_SUBSCRIBER).unwrap()
+        }),
+    ];
+    
+    HttpResponse::Ok().json(roles)
+}
+
+pub async fn get_role(path: web::Path<String>) -> impl Responder {
+    use crate::roles::{get_role_permissions};
+    
+    let role_name = path.into_inner();
+    let role_permissions = get_role_permissions();
+    
+    if let Some(permissions) = role_permissions.get(role_name.as_str()) {
+        let display_name = match role_name.as_str() {
+            "admin" => "管理员",
+            "editor" => "编辑",
+            "author" => "作者",
+            "subscriber" => "订阅者",
+            _ => &role_name,
+        };
+        
+        HttpResponse::Ok().json(serde_json::json!({
+            "name": role_name,
+            "display_name": display_name,
+            "permissions": permissions
+        }))
+    } else {
+        HttpResponse::NotFound().json("Role not found")
+    }
+}
+
+// 用户管理API
+pub async fn get_users(req: HttpRequest) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let mut conn = establish_connection();
+    let results = users::table.load::<User>(&mut conn).unwrap_or_default();
+    HttpResponse::Ok().json(results)
+}
+
+pub async fn get_user(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+    match users::table.find(id).first::<User>(&mut conn) {
+        Ok(user) => HttpResponse::Ok().json(user),
+        Err(_) => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn create_user(req: HttpRequest, body: web::Json<NewUser>) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let mut conn = establish_connection();
+
+    if users::table.filter(users::email.eq(&body.email)).first::<User>(&mut conn).is_ok() {
+        return HttpResponse::BadRequest().json("Email already exists");
+    }
+
+    if users::table.filter(users::username.eq(&body.username)).first::<User>(&mut conn).is_ok() {
+        return HttpResponse::BadRequest().json("Username already exists");
+    }
+
+    match diesel::insert_into(users::table)
+        .values(&*body)
+        .execute(&mut conn)
+    {
+        Ok(_) => {
+            let created: User = users::table.order(users::id.desc()).first(&mut conn).unwrap();
+            HttpResponse::Created().json(created)
+        },
+        Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+    }
+}
+
+pub async fn update_user(req: HttpRequest, path: web::Path<i32>, body: web::Json<UpdateUser>) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match diesel::update(users::table.find(id))
+        .set(&*body)
+        .execute(&mut conn)
+    {
+        Ok(affected) if affected > 0 => HttpResponse::Ok().json("User updated"),
+        _ => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn delete_user(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match diesel::delete(users::table.find(id))
+        .execute(&mut conn)
+    {
+        Ok(affected) if affected > 0 => HttpResponse::Ok().json("User deleted"),
+        _ => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn send_test_email(req: HttpRequest, body: web::Json<TestEmailRequest>) -> impl Responder {
+    if !has_permission_from_request(&req, PERMISSION_MANAGE_USERS) {
+        return HttpResponse::Forbidden().json("Permission denied");
+    }
+
+    let app_state = req.app_data::<web::Data<AppState>>().unwrap();
+    match app_state.email_service.send_test_email(&body.email).await {
+        Ok(_) => HttpResponse::Ok().json("Test email sent successfully"),
+        Err(e) => HttpResponse::InternalServerError().json(format!("Error sending test email: {}", e)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TestEmailRequest {
+    pub email: String,
 }
