@@ -34,6 +34,7 @@ diesel::table! {
         mimetype -> Text,
         size -> Bigint,
         uploaded_by -> Nullable<Integer>,
+        category -> Nullable<Text>,
         created_at -> Timestamp,
     }
 }
@@ -66,6 +67,11 @@ diesel::table! {
         is_top -> Nullable<Bool>,
         allow_comments -> Nullable<Bool>,
         view_count -> Nullable<Integer>,
+        seo_title -> Nullable<Text>,
+        seo_description -> Nullable<Text>,
+        seo_keywords -> Nullable<Text>,
+        seo_canonical -> Nullable<Text>,
+        seo_robots -> Nullable<Text>,
     }
 }
 
@@ -93,6 +99,35 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    post_versions (id) {
+        id -> Integer,
+        post_id -> Integer,
+        title -> Text,
+        slug -> Nullable<Text>,
+        content -> Text,
+        excerpt -> Nullable<Text>,
+        author -> Text,
+        status -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        published_at -> Nullable<Timestamp>,
+        category_id -> Nullable<Integer>,
+        user_id -> Nullable<Integer>,
+        summary -> Nullable<Text>,
+        cover_image -> Nullable<Text>,
+        is_published -> Nullable<Bool>,
+        is_top -> Nullable<Bool>,
+        allow_comments -> Nullable<Bool>,
+        version_number -> Integer,
+        seo_title -> Nullable<Text>,
+        seo_description -> Nullable<Text>,
+        seo_keywords -> Nullable<Text>,
+        seo_canonical -> Nullable<Text>,
+        seo_robots -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(comments -> posts (post_id));
 diesel::joinable!(comments -> users (user_id));
 diesel::joinable!(media -> users (uploaded_by));
@@ -100,5 +135,8 @@ diesel::joinable!(post_tags -> posts (post_id));
 diesel::joinable!(post_tags -> tags (tag_id));
 diesel::joinable!(posts -> categories (category_id));
 diesel::joinable!(posts -> users (user_id));
+diesel::joinable!(post_versions -> posts (post_id));
+diesel::joinable!(post_versions -> categories (category_id));
+diesel::joinable!(post_versions -> users (user_id));
 
-diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, tags, users,);
+diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, post_versions, tags, users,);

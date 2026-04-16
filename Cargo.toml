@@ -18,3 +18,6 @@ jsonwebtoken = "9.3.0"
 bcrypt = "0.15.0"
 actix-cors = "0.7.0"
 validator = { version = "0.16.0", features = ["derive"] }
+futures-util = "0.3.32"
+lru = "0.12.0"
+hashbrown = "0.14.3"

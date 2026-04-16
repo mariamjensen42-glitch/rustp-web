@@ -22,6 +22,11 @@ pub struct Post {
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
     pub view_count: Option<i32>,
+    pub seo_title: Option<String>,
+    pub seo_description: Option<String>,
+    pub seo_keywords: Option<String>,
+    pub seo_canonical: Option<String>,
+    pub seo_robots: Option<String>,
 }
 
 #[derive(Insertable, Deserialize)]
@@ -33,6 +38,7 @@ pub struct NewPost {
     pub excerpt: Option<String>,
     pub author: String,
     pub status: Option<String>,
+    pub published_at: Option<chrono::NaiveDateTime>,
     pub category_id: Option<i32>,
     pub user_id: Option<i32>,
     pub summary: Option<String>,
@@ -40,6 +46,11 @@ pub struct NewPost {
     pub is_published: Option<bool>,
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
+    pub seo_title: Option<String>,
+    pub seo_description: Option<String>,
+    pub seo_keywords: Option<String>,
+    pub seo_canonical: Option<String>,
+    pub seo_robots: Option<String>,
 }
 
 #[derive(AsChangeset, Deserialize)]
@@ -61,6 +72,11 @@ pub struct UpdatePost {
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
     pub view_count: Option<i32>,
+    pub seo_title: Option<String>,
+    pub seo_description: Option<String>,
+    pub seo_keywords: Option<String>,
+    pub seo_canonical: Option<String>,
+    pub seo_robots: Option<String>,
 }
 
 #[derive(Queryable, Serialize, Deserialize)]
@@ -200,6 +216,7 @@ pub struct Media {
     pub mimetype: String,
     pub size: i64,
     pub uploaded_by: Option<i32>,
+    pub category: Option<String>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -211,4 +228,61 @@ pub struct NewMedia {
     pub mimetype: String,
     pub size: i64,
     pub uploaded_by: Option<i32>,
+    pub category: Option<String>,
+}
+
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct PostVersion {
+    pub id: i32,
+    pub post_id: i32,
+    pub title: String,
+    pub slug: Option<String>,
+    pub content: String,
+    pub excerpt: Option<String>,
+    pub author: String,
+    pub status: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub category_id: Option<i32>,
+    pub user_id: Option<i32>,
+    pub summary: Option<String>,
+    pub cover_image: Option<String>,
+    pub is_published: Option<bool>,
+    pub is_top: Option<bool>,
+    pub allow_comments: Option<bool>,
+    pub version_number: i32,
+    pub seo_title: Option<String>,
+    pub seo_description: Option<String>,
+    pub seo_keywords: Option<String>,
+    pub seo_canonical: Option<String>,
+    pub seo_robots: Option<String>,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::post_versions)]
+pub struct NewPostVersion {
+    pub post_id: i32,
+    pub title: String,
+    pub slug: Option<String>,
+    pub content: String,
+    pub excerpt: Option<String>,
+    pub author: String,
+    pub status: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub category_id: Option<i32>,
+    pub user_id: Option<i32>,
+    pub summary: Option<String>,
+    pub cover_image: Option<String>,
+    pub is_published: Option<bool>,
+    pub is_top: Option<bool>,
+    pub allow_comments: Option<bool>,
+    pub version_number: i32,
+    pub seo_title: Option<String>,
+    pub seo_description: Option<String>,
+    pub seo_keywords: Option<String>,
+    pub seo_canonical: Option<String>,
+    pub seo_robots: Option<String>,
 }
