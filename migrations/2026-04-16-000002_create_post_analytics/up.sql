@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS post_analytics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    visit_date DATE NOT NULL,
+    visit_count INTEGER DEFAULT 0 NOT NULL,
+    unique_visitors INTEGER DEFAULT 0 NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_post_analytics_post_id_date ON post_analytics (post_id, visit_date);

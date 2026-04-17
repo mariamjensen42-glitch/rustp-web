@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpServer, HttpRequest, HttpMessage};
+use actix_web::{web, App, HttpServer};
 use actix_cors::Cors;
 use std::sync::Mutex;
 use std::collections::HashSet;
@@ -8,8 +8,10 @@ use crate::handlers::{
     get_comments, create_comment, approve_comment, delete_comment,
     get_categories, get_category, create_category, update_category, delete_category, get_category_posts,
     get_tags, create_tag, update_tag, delete_tag, get_tag_posts, add_post_tags,
-    upload_media, get_media, delete_media,
+    // upload_media, get_media, delete_media,
     search, add_post_tags as add_post_tags_handler, AppState,
+    get_post_versions, get_post_version, rollback_to_version,
+    schedule_post, get_post_analytics, get_related_posts, save_draft, get_drafts,
 };
 
 mod models;
@@ -64,10 +66,18 @@ async fn main() -> std::io::Result<()> {
             .route("/api/tags/{id}", web::put().to(update_tag))
             .route("/api/tags/{id}", web::delete().to(delete_tag))
             .route("/api/tags/{id}/posts", web::get().to(get_tag_posts))
-            .route("/api/media/upload", web::post().to(upload_media))
-            .route("/api/media", web::get().to(get_media))
-            .route("/api/media/{id}", web::delete().to(delete_media))
+            // .route("/api/media/upload", web::post().to(upload_media))
+            // .route("/api/media", web::get().to(get_media))
+            // .route("/api/media/{id}", web::delete().to(delete_media))
             .route("/api/search", web::get().to(search))
+            .route("/api/posts/{id}/versions", web::get().to(get_post_versions))
+            .route("/api/posts/{id}/versions/{version_number}", web::get().to(get_post_version))
+            .route("/api/posts/{id}/rollback", web::post().to(rollback_to_version))
+            .route("/api/posts/{id}/schedule", web::post().to(schedule_post))
+            .route("/api/posts/{id}/analytics", web::get().to(get_post_analytics))
+            .route("/api/posts/{id}/related", web::get().to(get_related_posts))
+            .route("/api/posts/{id}/draft", web::post().to(save_draft))
+            .route("/api/posts/drafts", web::get().to(get_drafts))
     })
     .bind("127.0.0.1:8080")?
     .run()

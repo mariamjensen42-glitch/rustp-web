@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
+use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
 use validator::Validate;
 use chrono::Utc;
 use std::sync::Mutex;
@@ -160,6 +160,12 @@ pub struct TagRequest {
 #[derive(serde::Deserialize)]
 pub struct SearchQuery {
     pub q: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PostTagsRequest {
+    pub post_id: i32,
+    pub tag_ids: Vec<i32>,
 }
 
 pub async fn register(req: web::Json<RegisterRequest>) -> impl Responder {
@@ -325,40 +331,54 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(10).min(100);
     let offset = (page - 1) * per_page;
+    let now = Utc::now().naive_utc();
 
-    let mut db_query = posts::table
+    let mut total_query = posts::table
         .filter(posts::deleted_at.is_null())
-        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+        .filter(
+            (posts::status.eq("published").or(posts::is_published.eq(true)))
+            .or(
+                posts::is_scheduled.eq(true)
+                    .and(posts::scheduled_at.le(now))
+            )
+        )
+        .into_boxed();
+
+    let mut data_query = posts::table
+        .filter(posts::deleted_at.is_null())
+        .filter(
+            (posts::status.eq("published").or(posts::is_published.eq(true)))
+            .or(
+                posts::is_scheduled.eq(true)
+                    .and(posts::scheduled_at.le(now))
+            )
+        )
         .into_boxed();
 
     if let Some(category_id) = query.category_id {
-        db_query = db_query.filter(posts::category_id.eq(category_id));
+        total_query = total_query.filter(posts::category_id.eq(category_id));
+        data_query = data_query.filter(posts::category_id.eq(category_id));
     }
 
     if let Some(q) = &query.q {
         let search_pattern = format!("%{}%", q);
-        db_query = db_query.filter(
-            posts::title.like(&search_pattern)
-                .or(posts::content.like(&search_pattern))
-                .or(posts::excerpt.like(&search_pattern))
+        total_query = total_query.filter(
+            posts::title.like(search_pattern.clone())
+                .or(posts::content.like(search_pattern.clone()))
+                .or(posts::excerpt.like(search_pattern))
+        );
+        let search_pattern2 = format!("%{}%", q);
+        data_query = data_query.filter(
+            posts::title.like(search_pattern2.clone())
+                .or(posts::content.like(search_pattern2.clone()))
+                .or(posts::excerpt.like(search_pattern2))
         );
     }
 
-    let sort_column = match query.sort_by.as_deref() {
-        Some("title") => posts::title,
-        Some("created_at") => posts::created_at,
-        Some("published_at") => posts::published_at,
-        _ => posts::created_at,
-    };
-
-    let sort_order = match query.order.as_deref() {
-        Some("asc") => diesel::dsl::Asc,
-        _ => diesel::dsl::Desc,
-    };
-
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
-    let results: Vec<Post> = db_query
-        .order(sort_column.desc())
+    let total: i64 = total_query.count().get_result(&mut conn).unwrap_or(0);
+    
+    let results: Vec<Post> = data_query
+        .order(posts::created_at.desc())
         .limit(per_page)
         .offset(offset)
         .load(&mut conn)
@@ -378,17 +398,57 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
 pub async fn get_post(path: web::Path<i32>) -> impl Responder {
     let id = path.into_inner();
     let mut conn = establish_connection();
+    let now = Utc::now().naive_utc();
+
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
             if post.deleted_at.is_some() {
                 return HttpResponse::NotFound().finish();
             }
-            if post.status.as_deref() != Some("published") && post.is_published != Some(true) {
+            
+            let is_published = post.status.as_deref() == Some("published") || post.is_published == Some(true);
+            let is_scheduled_and_ready = post.is_scheduled == Some(true) 
+                && post.scheduled_at.map(|dt| dt <= now).unwrap_or(false);
+            
+            if !is_published && !is_scheduled_and_ready {
                 return HttpResponse::NotFound().finish();
             }
+
+            let today = Utc::now().naive_utc().date();
+            
+            let existing_analytic = post_analytics::table
+                .filter(post_analytics::post_id.eq(id))
+                .filter(post_analytics::visit_date.eq(today))
+                .first::<PostAnalytic>(&mut conn);
+
+            match existing_analytic {
+                Ok(analytic) => {
+                    let update_data = UpdatePostAnalytic {
+                        visit_count: Some(analytic.visit_count + 1),
+                        unique_visitors: Some(analytic.unique_visitors),
+                        updated_at: Some(Utc::now().naive_utc()),
+                    };
+                    let _ = diesel::update(post_analytics::table.find(analytic.id))
+                        .set(&update_data)
+                        .execute(&mut conn);
+                },
+                Err(_) => {
+                    let new_analytic = NewPostAnalytic {
+                        post_id: id,
+                        visit_date: today,
+                        visit_count: 1,
+                        unique_visitors: 1,
+                    };
+                    let _ = diesel::insert_into(post_analytics::table)
+                        .values(&new_analytic)
+                        .execute(&mut conn);
+                }
+            }
+
             let _ = diesel::update(posts::table.find(id))
                 .set(posts::view_count.eq(post.view_count.unwrap_or(0) + 1))
                 .execute(&mut conn);
+
             HttpResponse::Ok().json(post)
         },
         Err(_) => HttpResponse::NotFound().finish(),
@@ -434,8 +494,11 @@ pub async fn create_post(req: HttpRequest, body: web::Json<CreatePostRequest>) -
         summary: body.summary.clone(),
         cover_image: body.cover_image.clone(),
         is_published: body.is_published,
-        is_top: body.is_top.unwrap_or(false),
-        allow_comments: body.allow_comments.unwrap_or(true),
+        is_top: body.is_top,
+        allow_comments: body.allow_comments,
+        scheduled_at: None,
+        is_scheduled: None,
+        auto_save_draft: Some(true),
     };
 
     let result = diesel::insert_into(posts::table)
@@ -477,6 +540,28 @@ pub async fn update_post(req: HttpRequest, path: web::Path<i32>, body: web::Json
                 return HttpResponse::Forbidden().json("Cannot edit another user's post");
             }
 
+            let latest_version = post_versions::table
+                .filter(post_versions::post_id.eq(id))
+                .select(diesel::dsl::max(post_versions::version_number))
+                .first::<Option<i32>>(&mut conn)
+                .unwrap_or(Some(0))
+                .unwrap_or(0);
+
+            let new_version = NewPostVersion {
+                post_id: id,
+                version_number: latest_version + 1,
+                title: post.title,
+                content: post.content,
+                excerpt: post.excerpt,
+                summary: post.summary,
+                cover_image: post.cover_image,
+                created_by: Some(user.user_id),
+            };
+
+            let _ = diesel::insert_into(post_versions::table)
+                .values(&new_version)
+                .execute(&mut conn);
+
             let update_data = UpdatePost {
                 title: body.title.clone(),
                 slug: body.slug.clone(),
@@ -494,6 +579,8 @@ pub async fn update_post(req: HttpRequest, path: web::Path<i32>, body: web::Json
                 is_top: body.is_top,
                 allow_comments: body.allow_comments,
                 view_count: None,
+                updated_at: Some(Utc::now().naive_utc()),
+                ..Default::default()
             };
 
             match diesel::update(posts::table.find(id))
@@ -670,14 +757,18 @@ pub async fn get_category_posts(path: web::Path<i32>, query: web::Query<Paginati
 
     let mut conn = establish_connection();
 
-    let mut db_query = posts::table
+    let total_query = posts::table
         .filter(posts::category_id.eq(category_id))
         .filter(posts::deleted_at.is_null())
-        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
-        .into_boxed();
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)));
 
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
-    let results: Vec<Post> = db_query
+    let data_query = posts::table
+        .filter(posts::category_id.eq(category_id))
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)));
+
+    let total: i64 = total_query.count().get_result(&mut conn).unwrap_or(0);
+    let results: Vec<Post> = data_query
         .order(posts::created_at.desc())
         .limit(per_page)
         .offset(offset)
@@ -776,14 +867,18 @@ pub async fn get_tag_posts(path: web::Path<i32>, query: web::Query<PaginationQue
         .load(&mut conn)
         .unwrap_or_default();
 
-    let mut db_query = posts::table
+    let total_query = posts::table
         .filter(posts::id.eq_any(&post_ids))
         .filter(posts::deleted_at.is_null())
-        .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
-        .into_boxed();
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)));
 
-    let total: i64 = db_query.clone().count().get_result(&mut conn).unwrap_or(0);
-    let results: Vec<Post> = db_query
+    let data_query = posts::table
+        .filter(posts::id.eq_any(&post_ids))
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("published").or(posts::is_published.eq(true)));
+
+    let total: i64 = total_query.count().get_result(&mut conn).unwrap_or(0);
+    let results: Vec<Post> = data_query
         .order(posts::created_at.desc())
         .limit(per_page)
         .offset(offset)
@@ -824,7 +919,7 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         return HttpResponse::NotFound().json("Post not found");
     }
 
-    let (user_id, status) = match user {
+    let (user_id, status_val) = match user {
         Some(u) => (Some(u.user_id), "approved".to_string()),
         None => (None, "pending".to_string()),
     };
@@ -837,7 +932,7 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         author_name: body.author_name.clone(),
         author_email: body.author_email.clone(),
         author_website: body.author_website.clone(),
-        status,
+        status: status_val.clone(),
     };
 
     match diesel::insert_into(comments::table)
@@ -845,7 +940,7 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         .execute(&mut conn)
     {
         Ok(_) => {
-            let message = if status == "pending" {
+            let message = if status_val == "pending" {
                 "Comment created successfully, pending approval"
             } else {
                 "Comment created successfully"
@@ -899,92 +994,92 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
     }
 }
 
-pub async fn upload_media(req: HttpRequest, mut payload: actix_multipart::Multipart) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
-    }
+// pub async fn upload_media(req: HttpRequest, mut payload: actix_multipart::Multipart) -> impl Responder {
+//     if !is_admin(&req) {
+//         return HttpResponse::Forbidden().json("Admin access required");
+//     }
 
-    let user = match get_user_from_request(&req) {
-        Some(u) => u,
-        None => return HttpResponse::Unauthorized().json("Unauthorized"),
-    };
+//     let user = match get_user_from_request(&req) {
+//         Some(u) => u,
+//         None => return HttpResponse::Unauthorized().json("Unauthorized"),
+//     };
 
-    while let Some(item) = payload.next().await {
-        if let Ok(mut field) = item {
-            let content_disposition = field.content_disposition();
-            let filename = content_disposition
-                .get_filename()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "file".to_string());
+//     while let Some(item) = payload.next().await {
+//         if let Ok(mut field) = item {
+//             let content_disposition = field.content_disposition();
+//             let filename = content_disposition
+//                 .get_filename()
+//                 .map(|s| s.to_string())
+//                 .unwrap_or_else(|| "file".to_string());
 
-            let mut data = Vec::new();
-            while let Some(chunk) = field.next().await {
-                if let Ok(bytes) = chunk {
-                    data.extend_from_slice(&bytes);
-                }
-            }
+//             let mut data = Vec::new();
+//             while let Some(chunk) = field.next().await {
+//                 if let Ok(bytes) = chunk {
+//                     data.extend_from_slice(&bytes);
+//                 }
+//             }
 
-            let filepath = format!("./uploads/{}", filename);
-            let mimetype = field
-                .content_type()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
+//             let filepath = format!("./uploads/{}", filename);
+//             let mimetype = field
+//                 .content_type()
+//                 .map(|m| m.to_string())
+//                 .unwrap_or_else(|| "application/octet-stream".to_string());
 
-            let mut conn = establish_connection();
-            let new_media = NewMedia {
-                filename: filename.clone(),
-                filepath: filepath.clone(),
-                mimetype,
-                size: data.len() as i64,
-                uploaded_by: Some(user.user_id),
-            };
+//             let mut conn = establish_connection();
+//             let new_media = NewMedia {
+//                 filename: filename.clone(),
+//                 filepath: filepath.clone(),
+//                 mimetype,
+//                 size: data.len() as i64,
+//                 uploaded_by: Some(user.user_id),
+//             };
 
-            match diesel::insert_into(media::table)
-                .values(&new_media)
-                .execute(&mut conn)
-            {
-                Ok(_) => {
-                    if let Ok(_) = std::fs::create_dir_all("./uploads") {
-                        let _ = std::fs::write(&filepath, &data);
-                    }
-                    return HttpResponse::Created().json(serde_json::json!({
-                        "filename": filename,
-                        "filepath": filepath
-                    }));
-                },
-                Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
-            }
-        }
-    }
+//             match diesel::insert_into(media::table)
+//                 .values(&new_media)
+//                 .execute(&mut conn)
+//             {
+//                 Ok(_) => {
+//                     if let Ok(_) = std::fs::create_dir_all("./uploads") {
+//                         let _ = std::fs::write(&filepath, &data);
+//                     }
+//                     return HttpResponse::Created().json(serde_json::json!({
+//                         "filename": filename,
+//                         "filepath": filepath
+//                     }));
+//                 },
+//                 Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+//             }
+//         }
+//     }
 
-    HttpResponse::BadRequest().json("No file uploaded")
-}
+//     HttpResponse::BadRequest().json("No file uploaded")
+// }
 
-pub async fn get_media(req: HttpRequest) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
-    }
+// pub async fn get_media(req: HttpRequest) -> impl Responder {
+//     if !is_admin(&req) {
+//         return HttpResponse::Forbidden().json("Admin access required");
+//     }
 
-    let mut conn = establish_connection();
-    let results = media::table.load::<Media>(&mut conn).unwrap_or_default();
-    HttpResponse::Ok().json(results)
-}
+//     let mut conn = establish_connection();
+//     let results = media::table.load::<Media>(&mut conn).unwrap_or_default();
+//     HttpResponse::Ok().json(results)
+// }
 
-pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-    if !is_admin(&req) {
-        return HttpResponse::Forbidden().json("Admin access required");
-    }
+// pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+//     if !is_admin(&req) {
+//         return HttpResponse::Forbidden().json("Admin access required");
+//     }
 
-    let id = path.into_inner();
-    let mut conn = establish_connection();
+//     let id = path.into_inner();
+//     let mut conn = establish_connection();
 
-    match diesel::delete(media::table.find(id))
-        .execute(&mut conn)
-    {
-        Ok(_) => HttpResponse::Ok().json("Media deleted"),
-        Err(_) => HttpResponse::NotFound().finish(),
-    }
-}
+//     match diesel::delete(media::table.find(id))
+//         .execute(&mut conn)
+//     {
+//         Ok(_) => HttpResponse::Ok().json("Media deleted"),
+//         Err(_) => HttpResponse::NotFound().finish(),
+//     }
+// }
 
 pub async fn search(query: web::Query<SearchQuery>) -> impl Responder {
     let mut conn = establish_connection();
@@ -1043,4 +1138,362 @@ pub async fn add_post_tags(req: HttpRequest, body: web::Json<PostTagsRequest>) -
     }
 
     HttpResponse::Ok().json("Post tags updated")
+}
+
+#[derive(serde::Deserialize)]
+pub struct SchedulePostRequest {
+    pub scheduled_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RollbackPostRequest {
+    pub version_number: i32,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SaveDraftRequest {
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub excerpt: Option<String>,
+    pub summary: Option<String>,
+}
+
+pub async fn get_post_versions(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot access another user's post versions");
+            }
+
+            let versions: Vec<PostVersion> = post_versions::table
+                .filter(post_versions::post_id.eq(post_id))
+                .order(post_versions::version_number.desc())
+                .load(&mut conn)
+                .unwrap_or_default();
+
+            HttpResponse::Ok().json(versions)
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn get_post_version(req: HttpRequest, path: web::Path<(i32, i32)>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let (post_id, version_number) = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot access another user's post version");
+            }
+
+            match post_versions::table
+                .filter(post_versions::post_id.eq(post_id))
+                .filter(post_versions::version_number.eq(version_number))
+                .first::<PostVersion>(&mut conn)
+            {
+                Ok(version) => HttpResponse::Ok().json(version),
+                Err(_) => HttpResponse::NotFound().json("Version not found"),
+            }
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn rollback_to_version(req: HttpRequest, path: web::Path<i32>, body: web::Json<RollbackPostRequest>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot rollback another user's post");
+            }
+
+            match post_versions::table
+                .filter(post_versions::post_id.eq(post_id))
+                .filter(post_versions::version_number.eq(body.version_number))
+                .first::<PostVersion>(&mut conn)
+            {
+                Ok(version) => {
+                    let latest_version = post_versions::table
+                        .filter(post_versions::post_id.eq(post_id))
+                        .select(diesel::dsl::max(post_versions::version_number))
+                        .first::<Option<i32>>(&mut conn)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0);
+
+                    let new_version = NewPostVersion {
+                        post_id,
+                        version_number: latest_version + 1,
+                        title: post.title,
+                        content: post.content,
+                        excerpt: post.excerpt,
+                        summary: post.summary,
+                        cover_image: post.cover_image,
+                        created_by: Some(user.user_id),
+                    };
+
+                    let _ = diesel::insert_into(post_versions::table)
+                        .values(&new_version)
+                        .execute(&mut conn);
+
+                    let update_data = UpdatePost {
+                        title: Some(version.title),
+                        content: Some(version.content),
+                        excerpt: version.excerpt,
+                        summary: version.summary,
+                        cover_image: version.cover_image,
+                        updated_at: Some(Utc::now().naive_utc()),
+                        ..Default::default()
+                    };
+
+                    match diesel::update(posts::table.find(post_id))
+                        .set(&update_data)
+                        .execute(&mut conn)
+                    {
+                        Ok(_) => HttpResponse::Ok().json("Post rolled back successfully"),
+                        Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+                    }
+                },
+                Err(_) => HttpResponse::NotFound().json("Version not found"),
+            }
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn schedule_post(req: HttpRequest, path: web::Path<i32>, body: web::Json<SchedulePostRequest>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot schedule another user's post");
+            }
+
+            let (is_scheduled, scheduled_at) = match &body.scheduled_at {
+                Some(dt) => (Some(true), Some(*dt)),
+                None => (Some(false), None),
+            };
+
+            let update_data = UpdatePost {
+                scheduled_at,
+                is_scheduled,
+                status: if is_scheduled == Some(true) { Some("scheduled".to_string()) } else { post.status },
+                ..Default::default()
+            };
+
+            match diesel::update(posts::table.find(post_id))
+                .set(&update_data)
+                .execute(&mut conn)
+            {
+                Ok(_) => HttpResponse::Ok().json("Post scheduled successfully"),
+                Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+            }
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn get_post_analytics(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot access another user's post analytics");
+            }
+
+            let analytics: Vec<PostAnalytic> = post_analytics::table
+                .filter(post_analytics::post_id.eq(post_id))
+                .order(post_analytics::visit_date.desc())
+                .load(&mut conn)
+                .unwrap_or_default();
+
+            let total_visits: i64 = analytics.iter().map(|a| a.visit_count as i64).sum();
+            let total_unique_visitors: i64 = analytics.iter().map(|a| a.unique_visitors as i64).sum();
+
+            HttpResponse::Ok().json(serde_json::json!({
+                "daily_analytics": analytics,
+                "total_visits": total_visits,
+                "total_unique_visitors": total_unique_visitors,
+                "current_view_count": post.view_count.unwrap_or(0)
+            }))
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn get_related_posts(path: web::Path<i32>) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            let mut related_posts = Vec::new();
+
+            if let Some(category_id) = post.category_id {
+                let category_posts: Vec<Post> = posts::table
+                    .filter(posts::category_id.eq(category_id))
+                    .filter(posts::id.ne(post_id))
+                    .filter(posts::deleted_at.is_null())
+                    .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+                    .order(posts::view_count.desc())
+                    .limit(5)
+                    .load(&mut conn)
+                    .unwrap_or_default();
+                related_posts.extend(category_posts);
+            }
+
+            let tag_ids: Vec<i32> = post_tags::table
+                .filter(post_tags::post_id.eq(post_id))
+                .select(post_tags::tag_id)
+                .load(&mut conn)
+                .unwrap_or_default();
+
+            if !tag_ids.is_empty() {
+                let tag_post_ids: Vec<i32> = post_tags::table
+                    .filter(post_tags::tag_id.eq_any(&tag_ids))
+                    .filter(post_tags::post_id.ne(post_id))
+                    .select(post_tags::post_id)
+                    .distinct()
+                    .load(&mut conn)
+                    .unwrap_or_default();
+
+                let tag_posts: Vec<Post> = posts::table
+                    .filter(posts::id.eq_any(&tag_post_ids))
+                    .filter(posts::id.ne(post_id))
+                    .filter(posts::deleted_at.is_null())
+                    .filter(posts::status.eq("published").or(posts::is_published.eq(true)))
+                    .order(posts::view_count.desc())
+                    .limit(5)
+                    .load(&mut conn)
+                    .unwrap_or_default();
+                related_posts.extend(tag_posts);
+            }
+
+            let mut seen_ids = HashSet::new();
+            let unique_posts: Vec<Post> = related_posts
+                .into_iter()
+                .filter(|p| seen_ids.insert(p.id))
+                .take(10)
+                .collect();
+
+            HttpResponse::Ok().json(unique_posts)
+        },
+        Err(_) => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn save_draft(req: HttpRequest, path: web::Path<i32>, body: web::Json<SaveDraftRequest>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.user_id != Some(user.user_id) && user.role != "admin" {
+                return HttpResponse::Forbidden().json("Cannot edit another user's post");
+            }
+
+            let update_data = UpdatePost {
+                title: body.title.clone(),
+                content: body.content.clone(),
+                excerpt: body.excerpt.clone(),
+                summary: body.summary.clone(),
+                draft_saved_at: Some(Utc::now().naive_utc()),
+                status: Some("draft".to_string()),
+                ..Default::default()
+            };
+
+            match diesel::update(posts::table.find(post_id))
+                .set(&update_data)
+                .execute(&mut conn)
+            {
+                Ok(_) => HttpResponse::Ok().json("Draft saved successfully"),
+                Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+            }
+        },
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn get_drafts(req: HttpRequest, query: web::Query<PaginationQuery>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(10).min(100);
+    let offset = (page - 1) * per_page;
+
+    let mut total_query = posts::table
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("draft"))
+        .into_boxed();
+
+    let mut data_query = posts::table
+        .filter(posts::deleted_at.is_null())
+        .filter(posts::status.eq("draft"))
+        .into_boxed();
+
+    if user.role != "admin" {
+        total_query = total_query.filter(posts::user_id.eq(user.user_id));
+        data_query = data_query.filter(posts::user_id.eq(user.user_id));
+    }
+
+    let total: i64 = total_query.count().get_result(&mut conn).unwrap_or(0);
+    let results: Vec<Post> = data_query
+        .order(posts::draft_saved_at.desc())
+        .limit(per_page)
+        .offset(offset)
+        .load(&mut conn)
+        .unwrap_or_default();
+
+    let total_pages = (total as f64 / per_page as f64).ceil() as i64;
+
+    HttpResponse::Ok().json(PaginatedResponse {
+        data: results,
+        page,
+        per_page,
+        total,
+        total_pages,
+    })
 }

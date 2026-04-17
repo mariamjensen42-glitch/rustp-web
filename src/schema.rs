@@ -66,6 +66,37 @@ diesel::table! {
         is_top -> Nullable<Bool>,
         allow_comments -> Nullable<Bool>,
         view_count -> Nullable<Integer>,
+        scheduled_at -> Nullable<Timestamp>,
+        is_scheduled -> Nullable<Bool>,
+        draft_saved_at -> Nullable<Timestamp>,
+        auto_save_draft -> Nullable<Bool>,
+    }
+}
+
+diesel::table! {
+    post_versions (id) {
+        id -> Integer,
+        post_id -> Integer,
+        version_number -> Integer,
+        title -> Text,
+        content -> Text,
+        excerpt -> Nullable<Text>,
+        summary -> Nullable<Text>,
+        cover_image -> Nullable<Text>,
+        created_by -> Nullable<Integer>,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    post_analytics (id) {
+        id -> Integer,
+        post_id -> Integer,
+        visit_date -> Date,
+        visit_count -> Integer,
+        unique_visitors -> Integer,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
     }
 }
 
@@ -100,5 +131,8 @@ diesel::joinable!(post_tags -> posts (post_id));
 diesel::joinable!(post_tags -> tags (tag_id));
 diesel::joinable!(posts -> categories (category_id));
 diesel::joinable!(posts -> users (user_id));
+diesel::joinable!(post_versions -> posts (post_id));
+diesel::joinable!(post_versions -> users (created_by));
+diesel::joinable!(post_analytics -> posts (post_id));
 
-diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, tags, users,);
+diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, tags, users, post_versions, post_analytics);

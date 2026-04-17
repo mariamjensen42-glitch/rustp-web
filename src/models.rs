@@ -22,6 +22,10 @@ pub struct Post {
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
     pub view_count: Option<i32>,
+    pub scheduled_at: Option<chrono::NaiveDateTime>,
+    pub is_scheduled: Option<bool>,
+    pub draft_saved_at: Option<chrono::NaiveDateTime>,
+    pub auto_save_draft: Option<bool>,
 }
 
 #[derive(Insertable, Deserialize)]
@@ -40,9 +44,12 @@ pub struct NewPost {
     pub is_published: Option<bool>,
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
+    pub scheduled_at: Option<chrono::NaiveDateTime>,
+    pub is_scheduled: Option<bool>,
+    pub auto_save_draft: Option<bool>,
 }
 
-#[derive(AsChangeset, Deserialize)]
+#[derive(AsChangeset, Deserialize, Default)]
 #[diesel(table_name = crate::schema::posts)]
 pub struct UpdatePost {
     pub title: Option<String>,
@@ -61,6 +68,66 @@ pub struct UpdatePost {
     pub is_top: Option<bool>,
     pub allow_comments: Option<bool>,
     pub view_count: Option<i32>,
+    pub scheduled_at: Option<chrono::NaiveDateTime>,
+    pub is_scheduled: Option<bool>,
+    pub draft_saved_at: Option<chrono::NaiveDateTime>,
+    pub auto_save_draft: Option<bool>,
+    pub updated_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct PostVersion {
+    pub id: i32,
+    pub post_id: i32,
+    pub version_number: i32,
+    pub title: String,
+    pub content: String,
+    pub excerpt: Option<String>,
+    pub summary: Option<String>,
+    pub cover_image: Option<String>,
+    pub created_by: Option<i32>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::post_versions)]
+pub struct NewPostVersion {
+    pub post_id: i32,
+    pub version_number: i32,
+    pub title: String,
+    pub content: String,
+    pub excerpt: Option<String>,
+    pub summary: Option<String>,
+    pub cover_image: Option<String>,
+    pub created_by: Option<i32>,
+}
+
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct PostAnalytic {
+    pub id: i32,
+    pub post_id: i32,
+    pub visit_date: chrono::NaiveDate,
+    pub visit_count: i32,
+    pub unique_visitors: i32,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::post_analytics)]
+pub struct NewPostAnalytic {
+    pub post_id: i32,
+    pub visit_date: chrono::NaiveDate,
+    pub visit_count: i32,
+    pub unique_visitors: i32,
+}
+
+#[derive(AsChangeset, Deserialize, Default)]
+#[diesel(table_name = crate::schema::post_analytics)]
+pub struct UpdatePostAnalytic {
+    pub visit_count: Option<i32>,
+    pub unique_visitors: Option<i32>,
+    pub updated_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(Queryable, Serialize, Deserialize)]
