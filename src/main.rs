@@ -1,17 +1,24 @@
 use actix_web::{web, App, HttpServer};
 use actix_cors::Cors;
+use actix_session::{SessionMiddleware, storage::CookieSessionStore};
+use actix_web::cookie::Key;
 use std::sync::Mutex;
 use std::collections::HashSet;
+use std::time::Duration;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+use crate::handlers::OpenApiDoc;
 use crate::handlers::{
     get_posts, get_post, get_post_by_slug, create_post, update_post, delete_post, update_post_status,
     register, login, logout, refresh_token, get_me, update_me, update_password,
     get_comments, create_comment, approve_comment, delete_comment,
     get_categories, get_category, create_category, update_category, delete_category, get_category_posts,
     get_tags, create_tag, update_tag, delete_tag, get_tag_posts, add_post_tags,
-    // upload_media, get_media, delete_media,
+    upload_media, get_media, delete_media,
     search, add_post_tags as add_post_tags_handler, AppState,
     get_post_versions, get_post_version, rollback_to_version,
     schedule_post, get_post_analytics, get_related_posts, save_draft, get_drafts,
+    get_all_users, create_user, update_user, delete_user,
 };
 
 mod models;
@@ -19,12 +26,23 @@ mod schema;
 mod db;
 mod handlers;
 mod auth;
+mod rate_limit;
+mod csrf;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(AppState {
         blacklist: Mutex::new(HashSet::new()),
     });
+
+    // 生成用于session的密钥
+    let session_key = Key::generate();
+
+    // 配置速率限制：每分钟60个请求
+    let rate_limiter = rate_limit::RateLimiter::new(60, Duration::from_secs(60));
+
+    // 配置CSRF保护
+    let csrf_protection = csrf::CsrfProtection::new("your-csrf-secret-key");
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -36,6 +54,12 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(app_state.clone())
             .wrap(cors)
+            .wrap(SessionMiddleware::new(
+                CookieSessionStore::default(),
+                session_key.clone()
+            ))
+            .wrap(rate_limiter.clone())
+            .wrap(csrf_protection.clone())
             .route("/api/auth/register", web::post().to(register))
             .route("/api/auth/login", web::post().to(login))
             .route("/api/auth/logout", web::post().to(logout))
@@ -43,6 +67,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/users/me", web::get().to(get_me))
             .route("/api/users/me", web::put().to(update_me))
             .route("/api/users/me/password", web::put().to(update_password))
+            .route("/api/users", web::get().to(get_all_users))
+            .route("/api/users", web::post().to(create_user))
+            .route("/api/users/{id}", web::put().to(update_user))
+            .route("/api/users/{id}", web::delete().to(delete_user))
             .route("/api/posts", web::get().to(get_posts))
             .route("/api/posts", web::post().to(create_post))
             .route("/api/posts/{id}", web::get().to(get_post))
@@ -66,9 +94,9 @@ async fn main() -> std::io::Result<()> {
             .route("/api/tags/{id}", web::put().to(update_tag))
             .route("/api/tags/{id}", web::delete().to(delete_tag))
             .route("/api/tags/{id}/posts", web::get().to(get_tag_posts))
-            // .route("/api/media/upload", web::post().to(upload_media))
-            // .route("/api/media", web::get().to(get_media))
-            // .route("/api/media/{id}", web::delete().to(delete_media))
+            .route("/api/media/upload", web::post().to(upload_media))
+            .route("/api/media", web::get().to(get_media))
+            .route("/api/media/{id}", web::delete().to(delete_media))
             .route("/api/search", web::get().to(search))
             .route("/api/posts/{id}/versions", web::get().to(get_post_versions))
             .route("/api/posts/{id}/versions/{version_number}", web::get().to(get_post_version))
@@ -78,6 +106,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/posts/{id}/related", web::get().to(get_related_posts))
             .route("/api/posts/{id}/draft", web::post().to(save_draft))
             .route("/api/posts/drafts", web::get().to(get_drafts))
+            .service(
+                SwaggerUi::new("/swagger-ui/{_:.*}")
+                    .url("/api-docs/openapi.json", OpenApiDoc::openapi())
+            )
     })
     .bind("127.0.0.1:8080")?
     .run()

@@ -41,6 +41,32 @@ pub fn verify_token(token: &str) -> Result<Claims, String> {
 }
 
 pub fn hash_password(password: &str) -> Result<String, String> {
+    // 验证密码强度
+    if password.len() < 8 {
+        return Err("Password must be at least 8 characters long".to_string());
+    }
+    
+    let mut has_uppercase = false;
+    let mut has_lowercase = false;
+    let mut has_number = false;
+    let mut has_special = false;
+    
+    for c in password.chars() {
+        if c.is_uppercase() {
+            has_uppercase = true;
+        } else if c.is_lowercase() {
+            has_lowercase = true;
+        } else if c.is_numeric() {
+            has_number = true;
+        } else if "@$!%*?&" .contains(c) {
+            has_special = true;
+        }
+    }
+    
+    if !has_uppercase || !has_lowercase || !has_number || !has_special {
+        return Err("Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character".to_string());
+    }
+    
     hash(password, DEFAULT_COST)
         .map_err(|e| e.to_string())
 }

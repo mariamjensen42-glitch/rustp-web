@@ -18,3 +18,11 @@ jsonwebtoken = "9.3.0"
 bcrypt = "0.15.0"
 actix-cors = "0.7.0"
 validator = { version = "0.16.0", features = ["derive"] }
+futures-util = "0.3.30"
+utoipa = { version = "4.2.3", features = ["chrono"] }
+utoipa-swagger-ui = { version = "7.1.0", features = ["actix-web"] }
+actix-http = "3.3.1"
+actix-session = { version = "0.7.2", features = ["cookie-session"] }
+redis = "0.24.0"
+rand = "0.8.5"
+base64 = "0.21.0"

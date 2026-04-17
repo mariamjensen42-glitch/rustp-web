@@ -1,11 +1,16 @@
 use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
+use actix_multipart::Multipart;
+use futures_util::stream::TryStreamExt;
 use diesel::prelude::*;
-use serde::{Deserialize, Serialize};
-use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
+use serde::{Serialize};
+use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, UpdateUser, Comment, NewComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
 use validator::Validate;
 use chrono::Utc;
 use std::sync::Mutex;
 use std::collections::HashSet;
+use utoipa::OpenApi;
+use utoipa::ToSchema;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 pub struct AppState {
     pub blacklist: Mutex<HashSet<String>>,
@@ -32,7 +37,7 @@ fn get_user_from_request(req: &HttpRequest) -> Option<Claims> {
     get_current_user(req)
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct PaginationQuery {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
@@ -40,7 +45,7 @@ pub struct PaginationQuery {
     pub order: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema, utoipa::IntoParams)]
 pub struct PostFilterQuery {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
@@ -51,7 +56,7 @@ pub struct PostFilterQuery {
     pub q: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
     pub page: i64,
@@ -60,43 +65,45 @@ pub struct PaginatedResponse<T> {
     pub total_pages: i64,
 }
 
-#[derive(serde::Deserialize, Validate)]
+#[derive(serde::Deserialize, Validate, ToSchema)]
 pub struct RegisterRequest {
     #[validate(length(min = 3, max = 50))]
     pub username: String,
     #[validate(email)]
     pub email: String,
-    #[validate(length(min = 6))]
+    #[validate(length(min = 8))]
     pub password: String,
 }
 
-#[derive(serde::Deserialize, Validate)]
+#[derive(serde::Deserialize, Validate, ToSchema)]
 pub struct LoginRequest {
     #[validate(email)]
     pub email: String,
-    #[validate(length(min = 6))]
+    #[validate(length(min = 8))]
     pub password: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Validate, ToSchema)]
 pub struct UpdatePasswordRequest {
+    #[validate(length(min = 8))]
     pub old_password: String,
+    #[validate(length(min = 8))]
     pub new_password: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct UpdateProfileRequest {
     pub username: Option<String>,
     pub bio: Option<String>,
     pub avatar: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct CreatePostRequest {
     pub title: String,
     pub slug: Option<String>,
@@ -112,7 +119,7 @@ pub struct CreatePostRequest {
     pub tag_ids: Option<Vec<i32>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct UpdatePostRequest {
     pub title: Option<String>,
     pub slug: Option<String>,
@@ -128,12 +135,12 @@ pub struct UpdatePostRequest {
     pub tag_ids: Option<Vec<i32>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct UpdateStatusRequest {
     pub status: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct CommentRequest {
     pub post_id: i32,
     pub content: String,
@@ -143,7 +150,7 @@ pub struct CommentRequest {
     pub author_website: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct CategoryRequest {
     pub name: String,
     pub slug: Option<String>,
@@ -151,46 +158,57 @@ pub struct CategoryRequest {
     pub parent_id: Option<i32>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct TagRequest {
     pub name: String,
     pub slug: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct SearchQuery {
     pub q: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct PostTagsRequest {
     pub post_id: i32,
     pub tag_ids: Vec<i32>,
 }
 
+#[utoipa::path(
+    post, 
+    path = "/api/auth/register",
+    request_body = RegisterRequest,
+    responses(
+        (status = 201, description = "User registered successfully"),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn register(req: web::Json<RegisterRequest>) -> impl Responder {
-    if let Err(errors) = req.validate() {
+    let register_data = req.into_inner();
+    if let Err(errors) = register_data.validate() {
         return HttpResponse::BadRequest().json(errors);
     }
 
     let mut conn = establish_connection();
 
-    if users::table.filter(users::email.eq(&req.email)).first::<User>(&mut conn).is_ok() {
+    if users::table.filter(users::email.eq(&register_data.email)).first::<User>(&mut conn).is_ok() {
         return HttpResponse::BadRequest().json("Email already exists");
     }
 
-    if users::table.filter(users::username.eq(&req.username)).first::<User>(&mut conn).is_ok() {
+    if users::table.filter(users::username.eq(&register_data.username)).first::<User>(&mut conn).is_ok() {
         return HttpResponse::BadRequest().json("Username already exists");
     }
 
-    let password_hash = match hash_password(&req.password) {
+    let password_hash = match hash_password(&register_data.password) {
         Ok(h) => h,
         Err(e) => return HttpResponse::InternalServerError().json(format!("Password error: {}", e)),
     };
 
     let new_user = NewUser {
-        username: req.username.clone(),
-        email: req.email.clone(),
+        username: register_data.username.clone(),
+        email: register_data.email.clone(),
         password_hash,
         role: "user".to_string(),
         avatar: None,
@@ -206,6 +224,17 @@ pub async fn register(req: web::Json<RegisterRequest>) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    post, 
+    path = "/api/auth/login",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Login successful"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn login(req: web::Json<LoginRequest>) -> impl Responder {
     if let Err(errors) = req.validate() {
         return HttpResponse::BadRequest().json(errors);
@@ -237,6 +266,13 @@ pub async fn login(req: web::Json<LoginRequest>) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    post, 
+    path = "/api/auth/logout",
+    responses(
+        (status = 200, description = "Logged out successfully")
+    )
+)]
 pub async fn logout(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if let Some(token) = extract_token(&req) {
         let mut blacklist = state.blacklist.lock().unwrap();
@@ -245,6 +281,16 @@ pub async fn logout(req: HttpRequest, state: web::Data<AppState>) -> impl Respon
     HttpResponse::Ok().json(serde_json::json!({"message": "Logged out successfully"}))
 }
 
+#[utoipa::path(
+    post, 
+    path = "/api/auth/refresh",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, description = "Token refreshed successfully"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn refresh_token(req: web::Json<RefreshRequest>) -> impl Responder {
     match verify_token(&req.refresh_token) {
         Ok(claims) => {
@@ -258,6 +304,15 @@ pub async fn refresh_token(req: web::Json<RefreshRequest>) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    get, 
+    path = "/api/users/me",
+    responses(
+        (status = 200, description = "Get current user"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found")
+    )
+)]
 pub async fn get_me(req: HttpRequest) -> impl Responder {
     match get_current_user(&req) {
         Some(claims) => {
@@ -278,6 +333,16 @@ pub async fn get_me(req: HttpRequest) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    put, 
+    path = "/api/users/me",
+    request_body = UpdateProfileRequest,
+    responses(
+        (status = 200, description = "Profile updated"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn update_me(req: HttpRequest, body: web::Json<UpdateProfileRequest>) -> impl Responder {
     match get_current_user(&req) {
         Some(claims) => {
@@ -298,16 +363,33 @@ pub async fn update_me(req: HttpRequest, body: web::Json<UpdateProfileRequest>) 
     }
 }
 
+#[utoipa::path(
+    put, 
+    path = "/api/users/me/password",
+    request_body = UpdatePasswordRequest,
+    responses(
+        (status = 200, description = "Password updated"),
+        (status = 400, description = "Invalid old password"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn update_password(req: HttpRequest, body: web::Json<UpdatePasswordRequest>) -> impl Responder {
+    let update_data = body.into_inner();
+    if let Err(errors) = update_data.validate() {
+        return HttpResponse::BadRequest().json(errors);
+    }
+
     match get_current_user(&req) {
         Some(claims) => {
             let mut conn = establish_connection();
             match users::table.find(claims.user_id).first::<User>(&mut conn) {
                 Ok(user) => {
-                    if !verify_password(&body.old_password, &user.password_hash).unwrap_or(false) {
+                    if !verify_password(&update_data.old_password, &user.password_hash).unwrap_or(false) {
                         return HttpResponse::BadRequest().json("Invalid old password");
                     }
-                    let new_hash = match hash_password(&body.new_password) {
+                    let new_hash = match hash_password(&update_data.new_password) {
                         Ok(h) => h,
                         Err(e) => return HttpResponse::InternalServerError().json(format!("Password error: {}", e)),
                     };
@@ -326,6 +408,14 @@ pub async fn update_password(req: HttpRequest, body: web::Json<UpdatePasswordReq
     }
 }
 
+#[utoipa::path(
+    get, 
+    path = "/api/posts",
+    params(PostFilterQuery),
+    responses(
+        (status = 200, description = "Get posts")
+    )
+)]
 pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     let mut conn = establish_connection();
     let page = query.page.unwrap_or(1).max(1);
@@ -395,6 +485,14 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     })
 }
 
+#[utoipa::path(
+    get, 
+    path = "/api/posts/{id}",
+    responses(
+        (status = 200, description = "Get post"),
+        (status = 404, description = "Post not found")
+    )
+)]
 pub async fn get_post(path: web::Path<i32>) -> impl Responder {
     let id = path.into_inner();
     let mut conn = establish_connection();
@@ -455,6 +553,14 @@ pub async fn get_post(path: web::Path<i32>) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    get, 
+    path = "/api/posts/slug/{slug}",
+    responses(
+        (status = 200, description = "Get post by slug"),
+        (status = 404, description = "Post not found")
+    )
+)]
 pub async fn get_post_by_slug(path: web::Path<String>) -> impl Responder {
     let slug = path.into_inner();
     let mut conn = establish_connection();
@@ -472,6 +578,16 @@ pub async fn get_post_by_slug(path: web::Path<String>) -> impl Responder {
     }
 }
 
+#[utoipa::path(
+    post, 
+    path = "/api/posts",
+    request_body = CreatePostRequest,
+    responses(
+        (status = 201, description = "Post created"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn create_post(req: HttpRequest, body: web::Json<CreatePostRequest>) -> impl Responder {
     let user = match get_user_from_request(&req) {
         Some(u) => u,
@@ -994,92 +1110,117 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
     }
 }
 
-// pub async fn upload_media(req: HttpRequest, mut payload: actix_multipart::Multipart) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+pub async fn upload_media(req: HttpRequest, mut payload: Multipart) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
 
-//     let user = match get_user_from_request(&req) {
-//         Some(u) => u,
-//         None => return HttpResponse::Unauthorized().json("Unauthorized"),
-//     };
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
 
-//     while let Some(item) = payload.next().await {
-//         if let Ok(mut field) = item {
-//             let content_disposition = field.content_disposition();
-//             let filename = content_disposition
-//                 .get_filename()
-//                 .map(|s| s.to_string())
-//                 .unwrap_or_else(|| "file".to_string());
+    while let Ok(Some(mut field)) = payload.try_next().await {
+        let filename = field.content_disposition()
+            .and_then(|cd| cd.get_filename())
+            .unwrap_or("file")
+            .to_string();
 
-//             let mut data = Vec::new();
-//             while let Some(chunk) = field.next().await {
-//                 if let Ok(bytes) = chunk {
-//                     data.extend_from_slice(&bytes);
-//                 }
-//             }
+        let mut data = Vec::new();
+        while let Ok(Some(bytes)) = field.try_next().await {
+            data.extend_from_slice(&bytes);
+        }
 
-//             let filepath = format!("./uploads/{}", filename);
-//             let mimetype = field
-//                 .content_type()
-//                 .map(|m| m.to_string())
-//                 .unwrap_or_else(|| "application/octet-stream".to_string());
+        // 验证文件大小（最大5MB）
+        const MAX_FILE_SIZE: i64 = 5 * 1024 * 1024;
+        if data.len() as i64 > MAX_FILE_SIZE {
+            return HttpResponse::BadRequest().json("File size exceeds 5MB limit");
+        }
 
-//             let mut conn = establish_connection();
-//             let new_media = NewMedia {
-//                 filename: filename.clone(),
-//                 filepath: filepath.clone(),
-//                 mimetype,
-//                 size: data.len() as i64,
-//                 uploaded_by: Some(user.user_id),
-//             };
+        // 验证文件类型
+        let mimetype = field
+            .content_type()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
 
-//             match diesel::insert_into(media::table)
-//                 .values(&new_media)
-//                 .execute(&mut conn)
-//             {
-//                 Ok(_) => {
-//                     if let Ok(_) = std::fs::create_dir_all("./uploads") {
-//                         let _ = std::fs::write(&filepath, &data);
-//                     }
-//                     return HttpResponse::Created().json(serde_json::json!({
-//                         "filename": filename,
-//                         "filepath": filepath
-//                     }));
-//                 },
-//                 Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
-//             }
-//         }
-//     }
+        let allowed_types = vec![
+            "image/jpeg", "image/png", "image/gif", "image/webp",
+            "application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "text/plain", "text/html", "text/css", "text/javascript"
+        ];
 
-//     HttpResponse::BadRequest().json("No file uploaded")
-// }
+        if !allowed_types.contains(&mimetype.as_str()) {
+            return HttpResponse::BadRequest().json("File type not allowed");
+        }
 
-// pub async fn get_media(req: HttpRequest) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+        let filepath = format!("./uploads/{}", filename);
 
-//     let mut conn = establish_connection();
-//     let results = media::table.load::<Media>(&mut conn).unwrap_or_default();
-//     HttpResponse::Ok().json(results)
-// }
+        let mut conn = establish_connection();
+        let new_media = NewMedia {
+            filename: filename.clone(),
+            filepath: filepath.clone(),
+            mimetype: mimetype.clone(),
+            size: data.len() as i64,
+            uploaded_by: Some(user.user_id),
+        };
 
-// pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+        match diesel::insert_into(media::table)
+            .values(&new_media)
+            .execute(&mut conn)
+        {
+            Ok(_) => {
+                if let Ok(_) = std::fs::create_dir_all("./uploads") {
+                    let _ = std::fs::write(&filepath, &data);
+                }
+                return HttpResponse::Created().json(serde_json::json!({
+                    "filename": filename,
+                    "filepath": filepath,
+                    "mimetype": mimetype,
+                    "size": data.len() as i64
+                }));
+            },
+            Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+        }
+    }
 
-//     let id = path.into_inner();
-//     let mut conn = establish_connection();
+    HttpResponse::BadRequest().json("No file uploaded")
+}
 
-//     match diesel::delete(media::table.find(id))
-//         .execute(&mut conn)
-//     {
-//         Ok(_) => HttpResponse::Ok().json("Media deleted"),
-//         Err(_) => HttpResponse::NotFound().finish(),
-//     }
-// }
+pub async fn get_media(req: HttpRequest) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let mut conn = establish_connection();
+    let results = media::table.load::<Media>(&mut conn).unwrap_or_default();
+    HttpResponse::Ok().json(results)
+}
+
+pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    // 先获取媒体信息，以便删除文件
+    match media::table.find(id).first::<Media>(&mut conn) {
+        Ok(media) => {
+            // 删除数据库记录
+            if diesel::delete(media::table.find(id)).execute(&mut conn).is_ok() {
+                // 删除文件
+                let _ = std::fs::remove_file(&media.filepath);
+                return HttpResponse::Ok().json("Media deleted");
+            }
+        },
+        _ => {}
+    }
+
+    HttpResponse::NotFound().finish()
+}
 
 pub async fn search(query: web::Query<SearchQuery>) -> impl Responder {
     let mut conn = establish_connection();
@@ -1140,22 +1281,45 @@ pub async fn add_post_tags(req: HttpRequest, body: web::Json<PostTagsRequest>) -
     HttpResponse::Ok().json("Post tags updated")
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct SchedulePostRequest {
     pub scheduled_at: Option<chrono::NaiveDateTime>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct RollbackPostRequest {
     pub version_number: i32,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct SaveDraftRequest {
     pub title: Option<String>,
     pub content: Option<String>,
     pub excerpt: Option<String>,
     pub summary: Option<String>,
+}
+
+#[derive(serde::Deserialize, Validate, ToSchema)]
+pub struct CreateUserRequest {
+    #[validate(length(min = 3, max = 50))]
+    pub username: String,
+    #[validate(email)]
+    pub email: String,
+    #[validate(length(min = 8))]
+    pub password: String,
+    pub role: String,
+    pub avatar: Option<String>,
+    pub bio: Option<String>,
+}
+
+#[derive(serde::Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub role: Option<String>,
+    pub avatar: Option<String>,
+    pub bio: Option<String>,
 }
 
 pub async fn get_post_versions(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
@@ -1412,7 +1576,137 @@ pub async fn get_related_posts(path: web::Path<i32>) -> impl Responder {
 
             HttpResponse::Ok().json(unique_posts)
         },
-        Err(_) => HttpResponse::NotFound().finish(),
+        Err(_) => HttpResponse::NotFound().json("Post not found"),
+    }
+}
+
+pub async fn get_all_users(req: HttpRequest, query: web::Query<PaginationQuery>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let mut conn = establish_connection();
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(10).min(100);
+    let offset = (page - 1) * per_page;
+
+    let total: i64 = users::table.count().get_result(&mut conn).unwrap_or(0);
+    let results: Vec<User> = users::table
+        .order(users::id.desc())
+        .limit(per_page)
+        .offset(offset)
+        .load(&mut conn)
+        .unwrap_or_default();
+
+    let total_pages = (total as f64 / per_page as f64).ceil() as i64;
+
+    HttpResponse::Ok().json(PaginatedResponse {
+        data: results,
+        page,
+        per_page,
+        total,
+        total_pages,
+    })
+}
+
+pub async fn create_user(req: HttpRequest, body: web::Json<CreateUserRequest>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let create_data = body.into_inner();
+    if let Err(errors) = create_data.validate() {
+        return HttpResponse::BadRequest().json(errors);
+    }
+
+    let mut conn = establish_connection();
+
+    if users::table.filter(users::email.eq(&create_data.email)).first::<User>(&mut conn).is_ok() {
+        return HttpResponse::BadRequest().json("Email already exists");
+    }
+
+    if users::table.filter(users::username.eq(&create_data.username)).first::<User>(&mut conn).is_ok() {
+        return HttpResponse::BadRequest().json("Username already exists");
+    }
+
+    let password_hash = match hash_password(&create_data.password) {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(format!("Password error: {}", e)),
+    };
+
+    let new_user = NewUser {
+        username: create_data.username.clone(),
+        email: create_data.email.clone(),
+        password_hash,
+        role: create_data.role.clone(),
+        avatar: create_data.avatar.clone(),
+        bio: create_data.bio.clone(),
+    };
+
+    match diesel::insert_into(users::table)
+        .values(&new_user)
+        .execute(&mut conn)
+    {
+        Ok(_) => {
+            let created_user: User = users::table.order(users::id.desc()).first(&mut conn).unwrap();
+            HttpResponse::Created().json(created_user)
+        },
+        Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+    }
+}
+
+pub async fn update_user(req: HttpRequest, path: web::Path<i32>, body: web::Json<UpdateUserRequest>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match users::table.find(id).first::<User>(&mut conn) {
+        Ok(user) => {
+            let mut update_data = UpdateUser {
+                username: body.username.clone(),
+                email: body.email.clone(),
+                password_hash: None,
+                role: body.role.clone(),
+                avatar: body.avatar.clone(),
+                bio: body.bio.clone(),
+            };
+
+            if let Some(password) = &body.password {
+                let password_hash = match hash_password(password) {
+                    Ok(h) => h,
+                    Err(e) => return HttpResponse::InternalServerError().json(format!("Password error: {}", e)),
+                };
+                update_data.password_hash = Some(password_hash);
+            }
+
+            match diesel::update(users::table.find(id))
+                .set(&update_data)
+                .execute(&mut conn)
+            {
+                Ok(_) => HttpResponse::Ok().json("User updated"),
+                Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
+            }
+        },
+        Err(_) => HttpResponse::NotFound().json("User not found"),
+    }
+}
+
+pub async fn delete_user(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    match diesel::delete(users::table.find(id))
+        .execute(&mut conn)
+    {
+        Ok(affected) if affected > 0 => HttpResponse::Ok().json("User deleted"),
+        _ => HttpResponse::NotFound().json("User not found"),
     }
 }
 
@@ -1497,3 +1791,40 @@ pub async fn get_drafts(req: HttpRequest, query: web::Query<PaginationQuery>) ->
         total_pages,
     })
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Blog API",
+        version = "1.0.0",
+        description = "Blog API documentation"
+    ),
+    paths(
+        register,
+        login,
+        logout,
+        refresh_token,
+        get_me,
+        update_me,
+        update_password,
+        get_posts,
+        get_post,
+        get_post_by_slug,
+        create_post
+    ),
+    components(
+        schemas(
+            RegisterRequest,
+            LoginRequest,
+            RefreshRequest,
+            UpdatePasswordRequest,
+            UpdateProfileRequest,
+            PostFilterQuery,
+            PaginationQuery,
+            PaginatedResponse<Post>,
+            CreatePostRequest,
+            UpdatePostRequest
+        )
+    )
+)]
+pub struct OpenApiDoc;
