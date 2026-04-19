@@ -1,4 +1,6 @@
 use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
+use actix_multipart::Multipart;
+use futures_util::TryStreamExt;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
@@ -994,92 +996,142 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
     }
 }
 
-// pub async fn upload_media(req: HttpRequest, mut payload: actix_multipart::Multipart) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+pub async fn upload_media(req: HttpRequest, mut payload: Multipart) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
 
-//     let user = match get_user_from_request(&req) {
-//         Some(u) => u,
-//         None => return HttpResponse::Unauthorized().json("Unauthorized"),
-//     };
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
 
-//     while let Some(item) = payload.next().await {
-//         if let Ok(mut field) = item {
-//             let content_disposition = field.content_disposition();
-//             let filename = content_disposition
-//                 .get_filename()
-//                 .map(|s| s.to_string())
-//                 .unwrap_or_else(|| "file".to_string());
+    // 使用 try_next() 遍历 multipart 字段
+    while let Some(field) = payload.try_next().await.transpose() {
+        match field {
+            Ok(mut field) => {
+                let filename = field.content_disposition()
+                    .and_then(|cd| cd.get_filename())
+                    .map(|s: &str| s.to_string())
+                    .unwrap_or_else(|| "file".to_string());
 
-//             let mut data = Vec::new();
-//             while let Some(chunk) = field.next().await {
-//                 if let Ok(bytes) = chunk {
-//                     data.extend_from_slice(&bytes);
-//                 }
-//             }
+                let mut data = Vec::new();
+                let max_size = 10 * 1024 * 1024; // 10MB
 
-//             let filepath = format!("./uploads/{}", filename);
-//             let mimetype = field
-//                 .content_type()
-//                 .map(|m| m.to_string())
-//                 .unwrap_or_else(|| "application/octet-stream".to_string());
+                // 使用 try_next() 读取字段内容
+                while let Some(chunk) = field.try_next().await.transpose() {
+                    match chunk {
+                        Ok(bytes) => {
+                            data.extend_from_slice(&bytes);
+                            
+                            // 检查文件大小限制
+                            if data.len() > max_size {
+                                return HttpResponse::BadRequest().json("File too large, maximum size is 10MB");
+                            }
+                        },
+                        Err(e) => {
+                            return HttpResponse::InternalServerError().json(format!("Failed to read file: {}", e));
+                        }
+                    }
+                }
 
-//             let mut conn = establish_connection();
-//             let new_media = NewMedia {
-//                 filename: filename.clone(),
-//                 filepath: filepath.clone(),
-//                 mimetype,
-//                 size: data.len() as i64,
-//                 uploaded_by: Some(user.user_id),
-//             };
+                // 验证文件类型（只允许图片）
+                let mimetype = field
+                    .content_type()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
 
-//             match diesel::insert_into(media::table)
-//                 .values(&new_media)
-//                 .execute(&mut conn)
-//             {
-//                 Ok(_) => {
-//                     if let Ok(_) = std::fs::create_dir_all("./uploads") {
-//                         let _ = std::fs::write(&filepath, &data);
-//                     }
-//                     return HttpResponse::Created().json(serde_json::json!({
-//                         "filename": filename,
-//                         "filepath": filepath
-//                     }));
-//                 },
-//                 Err(e) => return HttpResponse::InternalServerError().json(format!("Error: {}", e)),
-//             }
-//         }
-//     }
+                let allowed_types = vec![
+                    "image/jpeg",
+                    "image/png",
+                    "image/gif",
+                    "image/webp",
+                    "image/svg+xml",
+                ];
 
-//     HttpResponse::BadRequest().json("No file uploaded")
-// }
+                if !allowed_types.iter().any(|&t| mimetype.starts_with(t) || mimetype == t) {
+                    return HttpResponse::BadRequest().json("Only image files are allowed (JPEG, PNG, GIF, WebP, SVG)");
+                }
 
-// pub async fn get_media(req: HttpRequest) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+                // 生成唯一的文件名以避免冲突
+                let file_extension = filename.split('.').last().unwrap_or("");
+                let unique_filename = format!("{}_{}.{}", 
+                    chrono::Utc::now().timestamp(),
+                    uuid::Uuid::new_v4().to_string().replace("-", ""),
+                    file_extension
+                );
 
-//     let mut conn = establish_connection();
-//     let results = media::table.load::<Media>(&mut conn).unwrap_or_default();
-//     HttpResponse::Ok().json(results)
-// }
+                let filepath = format!("./uploads/{}", unique_filename);
 
-// pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
-//     if !is_admin(&req) {
-//         return HttpResponse::Forbidden().json("Admin access required");
-//     }
+                let mut conn = establish_connection();
+                let new_media = NewMedia {
+                    filename: unique_filename.clone(),
+                    filepath: filepath.clone(),
+                    mimetype,
+                    size: data.len() as i64,
+                    uploaded_by: Some(user.user_id),
+                };
 
-//     let id = path.into_inner();
-//     let mut conn = establish_connection();
+                match diesel::insert_into(media::table)
+                    .values(&new_media)
+                    .execute(&mut conn)
+                {
+                    Ok(_) => {
+                        if let Ok(_) = std::fs::create_dir_all("./uploads") {
+                            if let Err(e) = std::fs::write(&filepath, &data) {
+                                return HttpResponse::InternalServerError().json(format!("Failed to save file: {}", e));
+                            }
+                        }
+                        return HttpResponse::Created().json(serde_json::json!({
+                            "filename": unique_filename,
+                            "filepath": filepath,
+                            "message": "File uploaded successfully"
+                        }));
+                    },
+                    Err(e) => return HttpResponse::InternalServerError().json(format!("Database error: {}", e)),
+                }
+            },
+            Err(e) => {
+                return HttpResponse::InternalServerError().json(format!("Failed to process multipart: {}", e));
+            }
+        }
+    }
 
-//     match diesel::delete(media::table.find(id))
-//         .execute(&mut conn)
-//     {
-//         Ok(_) => HttpResponse::Ok().json("Media deleted"),
-//         Err(_) => HttpResponse::NotFound().finish(),
-//     }
-// }
+    HttpResponse::BadRequest().json("No file uploaded")
+}
+
+pub async fn get_media(req: HttpRequest) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let mut conn = establish_connection();
+    let results = media::table.order(media::created_at.desc()).load::<Media>(&mut conn).unwrap_or_default();
+    HttpResponse::Ok().json(results)
+}
+
+pub async fn delete_media(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    if !is_admin(&req) {
+        return HttpResponse::Forbidden().json("Admin access required");
+    }
+
+    let id = path.into_inner();
+    let mut conn = establish_connection();
+
+    // 先获取媒体信息，以便删除文件
+    let media_item: Option<Media> = media::table.find(id).first(&mut conn).ok();
+    
+    match diesel::delete(media::table.find(id)).execute(&mut conn) {
+        Ok(affected) if affected > 0 => {
+            // 尝试删除物理文件
+            if let Some(media) = media_item {
+                let _ = std::fs::remove_file(&media.filepath);
+            }
+            HttpResponse::Ok().json("Media deleted")
+        },
+        _ => HttpResponse::NotFound().finish(),
+    }
+}
 
 pub async fn search(query: web::Query<SearchQuery>) -> impl Responder {
     let mut conn = establish_connection();
@@ -1496,4 +1548,97 @@ pub async fn get_drafts(req: HttpRequest, query: web::Query<PaginationQuery>) ->
         total,
         total_pages,
     })
+}
+
+pub async fn upload_avatar(req: HttpRequest, mut payload: Multipart) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    // 使用 try_next() 遍历 multipart 字段
+    while let Some(field) = payload.try_next().await.transpose() {
+        match field {
+            Ok(mut field) => {
+                let filename = field.content_disposition()
+                    .and_then(|cd| cd.get_filename())
+                    .map(|s: &str| s.to_string())
+                    .unwrap_or_else(|| "avatar.jpg".to_string());
+
+                let mut data = Vec::new();
+                let max_size = 5 * 1024 * 1024; // 5MB
+
+                // 使用 try_next() 读取字段内容
+                while let Some(chunk) = field.try_next().await.transpose() {
+                    match chunk {
+                        Ok(bytes) => {
+                            data.extend_from_slice(&bytes);
+                            
+                            // 检查文件大小限制
+                            if data.len() > max_size {
+                                return HttpResponse::BadRequest().json("File too large, maximum size is 5MB");
+                            }
+                        },
+                        Err(e) => {
+                            return HttpResponse::InternalServerError().json(format!("Failed to read file: {}", e));
+                        }
+                    }
+                }
+
+                // 验证文件类型（只允许图片）
+                let mimetype = field
+                    .content_type()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "image/jpeg".to_string());
+
+                let allowed_types = vec![
+                    "image/jpeg",
+                    "image/png",
+                    "image/gif",
+                    "image/webp",
+                    "image/svg+xml",
+                ];
+
+                if !allowed_types.iter().any(|&t| mimetype.starts_with(t) || mimetype == t) {
+                    return HttpResponse::BadRequest().json("Only image files are allowed (JPEG, PNG, GIF, WebP, SVG)");
+                }
+
+                // 生成唯一的文件名以避免冲突
+                let file_extension = filename.split('.').last().unwrap_or("jpg");
+                let unique_filename = format!("avatar_{}_{}.{}", 
+                    user.user_id,
+                    uuid::Uuid::new_v4().to_string().replace("-", ""),
+                    file_extension
+                );
+
+                let filepath = format!("./uploads/{}", unique_filename);
+                let file_url = format!("/uploads/{}", unique_filename);
+
+                let mut conn = establish_connection();
+
+                match diesel::update(users::table.find(user.user_id))
+                    .set(users::avatar.eq(file_url.clone()))
+                    .execute(&mut conn)
+                {
+                    Ok(_) => {
+                        if let Ok(_) = std::fs::create_dir_all("./uploads") {
+                            if let Err(e) = std::fs::write(&filepath, &data) {
+                                return HttpResponse::InternalServerError().json(format!("Failed to save file: {}", e));
+                            }
+                        }
+                        return HttpResponse::Ok().json(serde_json::json!({
+                            "avatar": file_url,
+                            "message": "Avatar uploaded successfully"
+                        }));
+                    },
+                    Err(e) => return HttpResponse::InternalServerError().json(format!("Database error: {}", e)),
+                }
+            },
+            Err(e) => {
+                return HttpResponse::InternalServerError().json(format!("Failed to process multipart: {}", e));
+            }
+        }
+    }
+
+    HttpResponse::BadRequest().json("No file uploaded")
 }
