@@ -3,7 +3,7 @@
 <div align="center">
 
 ![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)
-![Actix Web](https://img.shields.io/badge/Actix%20Web-4.7.0-blue?style=flat-square&logo=actix-web)
+![Actix Web](https://img.shields.io/badge/Actix%20Web-4.7.0-blue?style=flat-square)
 ![Diesel](https://img.shields.io/badge/Diesel-2.1.0-red?style=flat-square)
 ![SQLite](https://img.shields.io/badge/SQLite-3.35+-blue?style=flat-square&logo=sqlite)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
@@ -24,7 +24,7 @@
 
 | 类别 | 徽章 |
 |------|------|
-| **技术栈** | ![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust) ![Actix Web](https://img.shields.io/badge/Actix%20Web-4.7.0-blue?style=for-the-badge&logo=actix-web) |
+| **技术栈** | ![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust) ![Actix Web](https://img.shields.io/badge/Actix%20Web-4.7.0-blue?style=for-the-badge) |
 | **数据库** | ![SQLite](https://img.shields.io/badge/SQLite-3.35+-blue?style=for-the-badge&logo=sqlite) ![Diesel](https://img.shields.io/badge/Diesel-2.1.0-red?style=for-the-badge) |
 | **认证** | ![JWT](https://img.shields.io/badge/JWT-Auth-000000?style=for-the-badge&logo=json-web-tokens) ![bcrypt](https://img.shields.io/badge/bcrypt-Password%20Hashing-green?style=for-the-badge) |
 | **开发工具** | ![Cargo](https://img.shields.io/badge/Cargo-Package%20Manager-orange?style=for-the-badge&logo=rust) ![Git](https://img.shields.io/badge/Git-Version%20Control-orange?style=for-the-badge&logo=git) |
