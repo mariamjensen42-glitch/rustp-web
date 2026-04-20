@@ -124,7 +124,19 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    user_read_history (id) {
+        id -> Integer,
+        user_id -> Integer,
+        post_id -> Integer,
+        read_at -> Timestamp,
+        read_duration -> Nullable<Integer>,
+    }
+}
+
 diesel::joinable!(comments -> posts (post_id));
+diesel::joinable!(user_read_history -> users (user_id));
+diesel::joinable!(user_read_history -> posts (post_id));
 diesel::joinable!(comments -> users (user_id));
 diesel::joinable!(media -> users (uploaded_by));
 diesel::joinable!(post_tags -> posts (post_id));
@@ -135,4 +147,4 @@ diesel::joinable!(post_versions -> posts (post_id));
 diesel::joinable!(post_versions -> users (created_by));
 diesel::joinable!(post_analytics -> posts (post_id));
 
-diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, tags, users, post_versions, post_analytics);
+diesel::allow_tables_to_appear_in_same_query!(categories, comments, media, post_tags, posts, tags, users, post_versions, post_analytics, user_read_history);

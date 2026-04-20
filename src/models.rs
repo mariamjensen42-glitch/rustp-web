@@ -279,3 +279,49 @@ pub struct NewMedia {
     pub size: i64,
     pub uploaded_by: Option<i32>,
 }
+
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct UserReadHistory {
+    pub id: i32,
+    pub user_id: i32,
+    pub post_id: i32,
+    pub read_at: chrono::NaiveDateTime,
+    pub read_duration: Option<i32>,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = crate::schema::user_read_history)]
+pub struct NewUserReadHistory {
+    pub user_id: i32,
+    pub post_id: i32,
+    pub read_duration: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RecommendedPost {
+    pub id: i32,
+    pub title: String,
+    pub slug: Option<String>,
+    pub excerpt: Option<String>,
+    pub cover_image: Option<String>,
+    pub author: String,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub category_name: Option<String>,
+    pub tag_names: Vec<String>,
+    pub view_count: Option<i32>,
+    pub relevance_score: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PostWithRecommendations {
+    pub post: Post,
+    pub recommendations: Option<Vec<RecommendedPost>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReadHistoryWithPost {
+    pub id: i32,
+    pub read_at: chrono::NaiveDateTime,
+    pub read_duration: Option<i32>,
+    pub post: Post,
+}

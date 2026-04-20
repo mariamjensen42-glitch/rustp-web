@@ -17,6 +17,7 @@ use crate::handlers::{
     get_post_versions, get_post_version, rollback_to_version,
     schedule_post, get_post_analytics, get_related_posts, save_draft, get_drafts,
     upload_avatar,
+    get_post_recommendations, get_my_read_history, delete_read_history_item, clear_read_history,
 };
 use crate::db::establish_connection;
 use crate::schema::posts;
@@ -127,6 +128,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/posts/{id}/draft", web::post().to(save_draft))
             .route("/api/posts/drafts", web::get().to(get_drafts))
             .route("/api/users/me/avatar", web::post().to(upload_avatar))
+            .route("/api/posts/{id}/recommendations", web::get().to(get_post_recommendations))
+            .route("/api/users/me/read-history", web::get().to(get_my_read_history))
+            .route("/api/users/me/read-history/{post_id}", web::delete().to(delete_read_history_item))
+            .route("/api/users/me/read-history", web::delete().to(clear_read_history))
             .service(Files::new("/uploads", "./uploads").show_files_listing())
     })
     .bind("127.0.0.1:8080")?
