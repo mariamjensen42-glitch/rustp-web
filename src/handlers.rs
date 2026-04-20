@@ -3,7 +3,7 @@ use actix_multipart::Multipart;
 use futures_util::TryStreamExt;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
+use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic, UserReadHistory, NewUserReadHistory, RecommendedPost, PostWithRecommendations, ReadHistoryWithPost}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, schema::user_read_history, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
 use validator::Validate;
 use chrono::Utc;
 use std::sync::Mutex;
@@ -11,6 +11,141 @@ use std::collections::HashSet;
 
 pub struct AppState {
     pub blacklist: Mutex<HashSet<String>>,
+}
+
+fn get_post_tags(conn: &mut SqliteConnection, post_id_val: i32) -> Vec<String> {
+    use crate::schema::post_tags;
+    use crate::schema::tags;
+    
+    post_tags::table
+        .filter(post_tags::post_id.eq(post_id_val))
+        .inner_join(tags::table)
+        .select(tags::name)
+        .load(conn)
+        .unwrap_or_default()
+}
+
+fn get_post_category_name(conn: &mut SqliteConnection, category_id: Option<i32>) -> Option<String> {
+    use crate::schema::categories;
+    
+    if let Some(cat_id) = category_id {
+        categories::table
+            .find(cat_id)
+            .select(categories::name)
+            .first(conn)
+            .ok()
+    } else {
+        None
+    }
+}
+
+fn get_user_read_post_ids(conn: &mut SqliteConnection, user_id: i32) -> Vec<i32> {
+    user_read_history::table
+        .filter(user_read_history::user_id.eq(user_id))
+        .select(user_read_history::post_id)
+        .load(conn)
+        .unwrap_or_default()
+}
+
+fn record_read_history(conn: &mut SqliteConnection, user_id: i32, post_id: i32) {
+    let existing = user_read_history::table
+        .filter(user_read_history::user_id.eq(user_id))
+        .filter(user_read_history::post_id.eq(post_id))
+        .first::<UserReadHistory>(conn);
+    
+    match existing {
+        Ok(record) => {
+            let _ = diesel::update(user_read_history::table.find(record.id))
+                .set(user_read_history::read_at.eq(Utc::now().naive_utc()))
+                .execute(conn);
+        },
+        Err(_) => {
+            let new_record = NewUserReadHistory {
+                user_id,
+                post_id,
+                read_duration: None,
+            };
+            let _ = diesel::insert_into(user_read_history::table)
+                .values(&new_record)
+                .execute(conn);
+        }
+    }
+}
+
+fn calculate_recommendations(
+    conn: &mut SqliteConnection,
+    current_post: &Post,
+    exclude_post_ids: &[i32],
+    limit: i64,
+) -> Vec<RecommendedPost> {
+    let now = Utc::now().naive_utc();
+    let thirty_days_ago = now - chrono::Duration::days(30);
+    
+    let current_category_id = current_post.category_id;
+    let current_tags = get_post_tags(conn, current_post.id);
+    
+    let published_posts: Vec<Post> = posts::table
+        .filter(posts::id.ne(current_post.id))
+        .filter(posts::deleted_at.is_null())
+        .filter(
+            posts::status.eq("published")
+                .or(posts::is_published.eq(true))
+        )
+        .order(posts::created_at.desc())
+        .load(conn)
+        .unwrap_or_default();
+    
+    let mut scored_posts: Vec<(i32, Post)> = published_posts
+        .into_iter()
+        .filter(|p| !exclude_post_ids.contains(&p.id))
+        .map(|post| {
+            let mut score = 0;
+            
+            if post.category_id == current_category_id {
+                score += 50;
+            }
+            
+            let post_tags = get_post_tags(conn, post.id);
+            let common_tags = current_tags
+                .iter()
+                .filter(|t| post_tags.contains(t))
+                .count();
+            score += (common_tags as i32 * 10).min(30);
+            
+            if let Some(published_at) = post.published_at {
+                if published_at >= thirty_days_ago {
+                    score += 20;
+                }
+            }
+            
+            (score, post)
+        })
+        .collect();
+    
+    scored_posts.sort_by(|a, b| b.0.cmp(&a.0));
+    
+    scored_posts
+        .into_iter()
+        .take(limit as usize)
+        .map(|(score, post)| {
+            let tag_names = get_post_tags(conn, post.id);
+            let category_name = get_post_category_name(conn, post.category_id);
+            
+            RecommendedPost {
+                id: post.id,
+                title: post.title,
+                slug: post.slug,
+                excerpt: post.excerpt,
+                cover_image: post.cover_image,
+                author: post.author,
+                published_at: post.published_at,
+                category_name,
+                tag_names,
+                view_count: post.view_count,
+                relevance_score: score,
+            }
+        })
+        .collect()
 }
 
 fn extract_token(req: &HttpRequest) -> Option<String> {
@@ -397,10 +532,11 @@ pub async fn get_posts(query: web::Query<PostFilterQuery>) -> impl Responder {
     })
 }
 
-pub async fn get_post(path: web::Path<i32>) -> impl Responder {
+pub async fn get_post(path: web::Path<i32>, req: HttpRequest) -> impl Responder {
     let id = path.into_inner();
     let mut conn = establish_connection();
     let now = Utc::now().naive_utc();
+    let current_user = get_current_user(&req);
 
     match posts::table.find(id).first::<Post>(&mut conn) {
         Ok(post) => {
@@ -451,7 +587,18 @@ pub async fn get_post(path: web::Path<i32>) -> impl Responder {
                 .set(posts::view_count.eq(post.view_count.unwrap_or(0) + 1))
                 .execute(&mut conn);
 
-            HttpResponse::Ok().json(post)
+            let recommendations = if let Some(user) = current_user {
+                record_read_history(&mut conn, user.user_id, id);
+                let read_ids = get_user_read_post_ids(&mut conn, user.user_id);
+                Some(calculate_recommendations(&mut conn, &post, &read_ids, 6))
+            } else {
+                None
+            };
+
+            HttpResponse::Ok().json(PostWithRecommendations {
+                post,
+                recommendations,
+            })
         },
         Err(_) => HttpResponse::NotFound().finish(),
     }
@@ -1641,4 +1788,126 @@ pub async fn upload_avatar(req: HttpRequest, mut payload: Multipart) -> impl Res
     }
 
     HttpResponse::BadRequest().json("No file uploaded")
+}
+
+pub async fn get_post_recommendations(path: web::Path<i32>, req: HttpRequest) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+    let now = Utc::now().naive_utc();
+    let current_user = get_current_user(&req);
+
+    match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(post) => {
+            if post.deleted_at.is_some() {
+                return HttpResponse::NotFound().finish();
+            }
+            
+            let is_published = post.status.as_deref() == Some("published") || post.is_published == Some(true);
+            let is_scheduled_and_ready = post.is_scheduled == Some(true) 
+                && post.scheduled_at.map(|dt| dt <= now).unwrap_or(false);
+            
+            if !is_published && !is_scheduled_and_ready {
+                return HttpResponse::NotFound().finish();
+            }
+
+            let exclude_ids = if let Some(user) = current_user {
+                record_read_history(&mut conn, user.user_id, post_id);
+                get_user_read_post_ids(&mut conn, user.user_id)
+            } else {
+                vec![]
+            };
+
+            let recommendations = calculate_recommendations(&mut conn, &post, &exclude_ids, 6);
+            
+            HttpResponse::Ok().json(serde_json::json!({
+                "recommendations": recommendations
+            }))
+        },
+        Err(_) => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn get_my_read_history(req: HttpRequest, query: web::Query<PaginationQuery>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(10).min(100);
+    let offset = (page - 1) * per_page;
+
+    let total: i64 = user_read_history::table
+        .filter(user_read_history::user_id.eq(user.user_id))
+        .count()
+        .get_result(&mut conn)
+        .unwrap_or(0);
+
+    let history_records: Vec<UserReadHistory> = user_read_history::table
+        .filter(user_read_history::user_id.eq(user.user_id))
+        .order(user_read_history::read_at.desc())
+        .limit(per_page)
+        .offset(offset)
+        .load(&mut conn)
+        .unwrap_or_default();
+
+    let mut data = Vec::new();
+    for record in history_records {
+        if let Ok(post) = posts::table.find(record.post_id).first::<Post>(&mut conn) {
+            data.push(ReadHistoryWithPost {
+                id: record.id,
+                read_at: record.read_at,
+                read_duration: record.read_duration,
+                post,
+            });
+        }
+    }
+
+    let total_pages = (total as f64 / per_page as f64).ceil() as i64;
+
+    HttpResponse::Ok().json(PaginatedResponse {
+        data,
+        page,
+        per_page,
+        total,
+        total_pages,
+    })
+}
+
+pub async fn delete_read_history_item(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    let post_id = path.into_inner();
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+    
+    match diesel::delete(
+        user_read_history::table
+            .filter(user_read_history::user_id.eq(user.user_id))
+            .filter(user_read_history::post_id.eq(post_id))
+    )
+    .execute(&mut conn)
+    {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"message": "Read history item deleted"})),
+        Err(_) => HttpResponse::NotFound().json("Record not found"),
+    }
+}
+
+pub async fn clear_read_history(req: HttpRequest) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+    
+    let _ = diesel::delete(
+        user_read_history::table.filter(user_read_history::user_id.eq(user.user_id))
+    )
+    .execute(&mut conn);
+    
+    HttpResponse::Ok().json(serde_json::json!({"message": "Read history cleared"}))
 }
