@@ -9,7 +9,7 @@ use diesel::prelude::*;
 use crate::handlers::{
     get_posts, get_post, get_post_by_slug, create_post, update_post, delete_post, update_post_status,
     register, login, logout, refresh_token, get_me, update_me, update_password,
-    get_comments, create_comment, approve_comment, delete_comment,
+    get_comments, create_comment, approve_comment, delete_comment, like_comment, get_comment_likes, get_user_notifications, mark_notification_read,
     get_categories, get_category, create_category, update_category, delete_category, get_category_posts,
     get_tags, create_tag, update_tag, delete_tag, get_tag_posts,
     upload_media, get_media, delete_media,
@@ -18,6 +18,7 @@ use crate::handlers::{
     schedule_post, get_post_analytics, get_related_posts, save_draft, get_drafts,
     upload_avatar,
     get_post_recommendations, get_my_read_history, delete_read_history_item, clear_read_history,
+    export_post_markdown, export_post_pdf, export_post_html, export_posts_markdown, export_posts_pdf, export_posts_html,
 };
 use crate::db::establish_connection;
 use crate::schema::posts;
@@ -104,6 +105,11 @@ async fn main() -> std::io::Result<()> {
             .route("/api/posts/tags", web::post().to(add_post_tags_handler))
             .route("/api/comments/{id}/approve", web::put().to(approve_comment))
             .route("/api/comments/{id}", web::delete().to(delete_comment))
+            .route("/api/comments/{id}/like", web::post().to(like_comment))
+            .route("/api/comments/{id}/like", web::delete().to(like_comment))
+            .route("/api/comments/{id}/likes", web::get().to(get_comment_likes))
+            .route("/api/users/me/notifications", web::get().to(get_user_notifications))
+            .route("/api/notifications/{id}/read", web::put().to(mark_notification_read))
             .route("/api/categories", web::get().to(get_categories))
             .route("/api/categories", web::post().to(create_category))
             .route("/api/categories/{id}", web::get().to(get_category))
@@ -132,6 +138,13 @@ async fn main() -> std::io::Result<()> {
             .route("/api/users/me/read-history", web::get().to(get_my_read_history))
             .route("/api/users/me/read-history/{post_id}", web::delete().to(delete_read_history_item))
             .route("/api/users/me/read-history", web::delete().to(clear_read_history))
+            // 内容导出功能
+            .route("/api/posts/{id}/export/markdown", web::get().to(export_post_markdown))
+            .route("/api/posts/{id}/export/pdf", web::get().to(export_post_pdf))
+            .route("/api/posts/{id}/export/html", web::get().to(export_post_html))
+            .route("/api/posts/export/markdown", web::get().to(export_posts_markdown))
+            .route("/api/posts/export/pdf", web::get().to(export_posts_pdf))
+            .route("/api/posts/export/html", web::get().to(export_posts_html))
             .service(Files::new("/uploads", "./uploads").show_files_listing())
     })
     .bind("127.0.0.1:8080")?

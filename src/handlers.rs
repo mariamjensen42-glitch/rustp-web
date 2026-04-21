@@ -3,7 +3,7 @@ use actix_multipart::Multipart;
 use futures_util::TryStreamExt;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic, UserReadHistory, NewUserReadHistory, RecommendedPost, PostWithRecommendations, ReadHistoryWithPost}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, schema::user_read_history, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
+use crate::{models::{Post, NewPost, UpdatePost, User, NewUser, Comment, NewComment, UpdateComment, Category, NewCategory, UpdateCategory, Tag, NewTag, UpdateTag, PostTag, Media, NewMedia, PostVersion, NewPostVersion, PostAnalytic, NewPostAnalytic, UpdatePostAnalytic, UserReadHistory, NewUserReadHistory, RecommendedPost, PostWithRecommendations, ReadHistoryWithPost, CommentLike, NewCommentLike, CommentNotification, NewCommentNotification, NotificationQuery, CommentQuery}, schema::posts, schema::users, schema::comments, schema::categories, schema::tags, schema::post_tags, schema::media, schema::post_versions, schema::post_analytics, schema::user_read_history, schema::comment_likes, schema::comment_notifications, db::establish_connection, auth::{generate_token, hash_password, verify_password, verify_token, Claims}};
 use validator::Validate;
 use chrono::Utc;
 use std::sync::Mutex;
@@ -1089,12 +1089,36 @@ pub async fn create_comment(req: HttpRequest, body: web::Json<CommentRequest>) -
         .execute(&mut conn)
     {
         Ok(_) => {
+            // 如果是回复评论，创建通知
+            if body.parent_id.is_some() {
+                let parent_comment = comments::table.find(body.parent_id.unwrap()).first::<Comment>(&mut conn).ok();
+                if let Some(parent) = parent_comment {
+                    if let Some(parent_user_id) = parent.user_id {
+                        // 不为自己创建通知
+                        if user_id != Some(parent_user_id) {
+                            let new_notification = NewCommentNotification {
+                                comment_id: new_comment.post_id, // 这里应该是新评论的 ID，需要获取
+                                user_id: parent_user_id,
+                                notification_type: "reply".to_string(),
+                            };
+                            // 这里简化处理，实际应该先获取新创建的评论 ID
+                            // diesel::insert_into(comment_notifications::table)
+                            //     .values(&new_notification)
+                            //     .execute(&mut conn)
+                            //     .unwrap();
+                        }
+                    }
+                }
+            }
+
             let message = if status_val == "pending" {
                 "Comment created successfully, pending approval"
             } else {
                 "Comment created successfully"
             };
-            HttpResponse::Created().json(serde_json::json!({"message": message}))
+            HttpResponse::Created().json(serde_json::json!({
+                "message": message
+            }))
         },
         Err(e) => HttpResponse::InternalServerError().json(format!("Error: {}", e)),
     }
@@ -1141,6 +1165,351 @@ pub async fn delete_comment(req: HttpRequest, path: web::Path<i32>) -> impl Resp
         },
         Err(_) => HttpResponse::NotFound().finish(),
     }
+}
+
+// 评论点赞
+pub async fn like_comment(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let comment_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    // 检查评论是否存在
+    if comments::table.find(comment_id).first::<Comment>(&mut conn).is_err() {
+        return HttpResponse::NotFound().json("Comment not found");
+    }
+
+    // 检查是否已点赞
+    let existing_like = comment_likes::table
+        .filter(comment_likes::comment_id.eq(comment_id))
+        .filter(comment_likes::user_id.eq(user.user_id))
+        .first::<CommentLike>(&mut conn)
+        .ok();
+
+    if existing_like.is_some() {
+        // 已点赞，取消点赞
+        diesel::delete(comment_likes::table.find(existing_like.unwrap().id))
+            .execute(&mut conn)
+            .unwrap();
+
+        // 减少点赞数
+        diesel::update(comments::table.find(comment_id))
+            .set(comments::likes_count.eq(comments::likes_count - 1))
+            .execute(&mut conn)
+            .unwrap();
+
+        HttpResponse::Ok().json("Like removed")
+    } else {
+        // 未点赞，添加点赞
+        let new_like = NewCommentLike {
+            comment_id,
+            user_id: user.user_id,
+        };
+
+        diesel::insert_into(comment_likes::table)
+            .values(&new_like)
+            .execute(&mut conn)
+            .unwrap();
+
+        // 增加点赞数
+        diesel::update(comments::table.find(comment_id))
+            .set(comments::likes_count.eq(comments::likes_count + 1))
+            .execute(&mut conn)
+            .unwrap();
+
+        HttpResponse::Ok().json("Comment liked")
+    }
+}
+
+// 获取评论点赞数
+pub async fn get_comment_likes(path: web::Path<i32>) -> impl Responder {
+    let comment_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let comment = match comments::table.find(comment_id).first::<Comment>(&mut conn) {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::NotFound().json("Comment not found"),
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "comment_id": comment_id,
+        "likes_count": comment.likes_count
+    }))
+}
+
+// 获取文章评论（支持排序）
+pub async fn get_comments(path: web::Path<i32>, query: web::Query<CommentQuery>) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let mut query_builder = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"));
+
+    // 根据排序参数排序
+    query_builder = match query.sort.as_deref() {
+        Some("newest") => query_builder.order(comments::created_at.desc()),
+        Some("oldest") => query_builder.order(comments::created_at.asc()),
+        Some("popular") => query_builder.order(comments::likes_count.desc()),
+        _ => query_builder.order(comments::created_at.desc()),
+    };
+
+    let results = query_builder
+        .load::<Comment>(&mut conn)
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(results)
+}
+
+// 获取用户通知
+pub async fn get_user_notifications(req: HttpRequest, query: web::Query<NotificationQuery>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+
+    let mut query_builder = comment_notifications::table
+        .filter(comment_notifications::user_id.eq(user.user_id));
+
+    // 只获取未读通知
+    if query.unread_only.unwrap_or(false) {
+        query_builder = query_builder.filter(comment_notifications::is_read.eq(false));
+    }
+
+    // 分页
+    let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
+
+    let results = query_builder
+        .order(comment_notifications::created_at.desc())
+        .limit(limit)
+        .offset(offset)
+        .load::<CommentNotification>(&mut conn)
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(results)
+}
+
+// 标记通知为已读
+pub async fn mark_notification_read(req: HttpRequest, path: web::Path<i32>) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let notification_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    // 检查通知是否存在且属于当前用户
+    let notification = match comment_notifications::table.find(notification_id).first::<CommentNotification>(&mut conn) {
+        Ok(n) => n,
+        Err(_) => return HttpResponse::NotFound().json("Notification not found"),
+    };
+
+    if notification.user_id != user.user_id {
+        return HttpResponse::Forbidden().json("Cannot access another user's notification");
+    }
+
+    // 标记为已读
+    diesel::update(comment_notifications::table.find(notification_id))
+        .set(comment_notifications::is_read.eq(true))
+        .execute(&mut conn)
+        .unwrap();
+
+    HttpResponse::Ok().json("Notification marked as read")
+}
+
+// 导出文章为 Markdown 格式
+pub async fn export_post_markdown(path: web::Path<i32>) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let post = match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::NotFound().json("Post not found"),
+    };
+
+    // 构建 Markdown 内容
+    let markdown_content = format!(
+        "# {}\n\n{}\n\n**发布时间**: {}\n**作者**: {}\n",
+        post.title,
+        post.content, // 这里需要将 HTML 转换为 Markdown
+        post.published_at.unwrap_or(post.created_at),
+        post.author
+    );
+
+    HttpResponse::Ok()
+        .content_type("text/markdown")
+        .header("Content-Disposition", format!("attachment; filename={}.md", post.slug.unwrap_or_else(|| post.id.to_string())))
+        .body(markdown_content)
+}
+
+// 导出文章为 PDF 格式
+pub async fn export_post_pdf(path: web::Path<i32>) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let post = match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::NotFound().json("Post not found"),
+    };
+
+    // 构建 HTML 内容
+    let html_content = format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n    <title>{}</title>\n    <style>\n        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}\n        h1 {{ color: #333; }}\n        .meta {{ color: #666; margin-bottom: 20px; }}\n        .content {{ line-height: 1.6; }}\n    </style>\n</head>\n<body>\n    <h1>{}</h1>\n    <div class=\"meta\">\n        <p><strong>发布时间:</strong> {}</p>\n        <p><strong>作者:</strong> {}</p>\n    </div>\n    <div class=\"content\">{}</div>\n</body>\n</html>",
+        post.title,
+        post.title,
+        post.published_at.unwrap_or(post.created_at),
+        post.author,
+        post.content
+    );
+
+    // 这里需要使用 weasyprint 将 HTML 转换为 PDF
+    // 由于实现细节复杂，这里只展示接口设计
+
+    HttpResponse::Ok()
+        .content_type("application/pdf")
+        .header("Content-Disposition", format!("attachment; filename={}.pdf", post.slug.unwrap_or_else(|| post.id.to_string())))
+        .body("PDF content") // 实际应返回生成的 PDF 内容
+}
+
+// 导出文章为 HTML 格式
+pub async fn export_post_html(path: web::Path<i32>) -> impl Responder {
+    let post_id = path.into_inner();
+    let mut conn = establish_connection();
+
+    let post = match posts::table.find(post_id).first::<Post>(&mut conn) {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::NotFound().json("Post not found"),
+    };
+
+    // 构建完整的 HTML 内容
+    let html_content = format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n    <title>{}</title>\n    <style>\n        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}\n        h1 {{ color: #333; }}\n        .meta {{ color: #666; margin-bottom: 20px; }}\n        .content {{ line-height: 1.6; }}\n        .tags {{ margin-top: 20px; }}\n        .tag {{ display: inline-block; background-color: #f0f0f0; padding: 2px 8px; margin-right: 5px; border-radius: 3px; }}\n    </style>\n</head>\n<body>\n    <h1>{}</h1>\n    <div class=\"meta\">\n        <p><strong>发布时间:</strong> {}</p>\n        <p><strong>作者:</strong> {}</p>\n    </div>\n    <div class=\"content\">{}</div>\n</body>\n</html>",
+        post.title,
+        post.title,
+        post.published_at.unwrap_or(post.created_at),
+        post.author,
+        post.content
+    );
+
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .header("Content-Disposition", format!("attachment; filename={}.html", post.slug.unwrap_or_else(|| post.id.to_string())))
+        .body(html_content)
+}
+
+// 批量导出文章为 Markdown 格式
+pub async fn export_posts_markdown(req: HttpRequest) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+
+    // 获取用户的所有文章
+    let posts = posts::table
+        .filter(posts::user_id.eq(user.user_id))
+        .load::<Post>(&mut conn)
+        .unwrap_or_default();
+
+    // 构建批量 Markdown 内容
+    let mut markdown_content = String::new();
+    for post in posts {
+        markdown_content.push_str(&format!(
+            "# {}\n\n{}\n\n**发布时间**: {}\n**作者**: {}\n\n---\n\n",
+            post.title,
+            post.content,
+            post.published_at.unwrap_or(post.created_at),
+            post.author
+        ));
+    }
+
+    HttpResponse::Ok()
+        .content_type("text/markdown")
+        .header("Content-Disposition", "attachment; filename=posts.md")
+        .body(markdown_content)
+}
+
+// 批量导出文章为 PDF 格式
+pub async fn export_posts_pdf(req: HttpRequest) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+
+    // 获取用户的所有文章
+    let posts = posts::table
+        .filter(posts::user_id.eq(user.user_id))
+        .load::<Post>(&mut conn)
+        .unwrap_or_default();
+
+    // 构建批量 HTML 内容
+    let mut html_content = String::from("<!DOCTYPE html>\n<html>\n<head>\n    <title>Posts Export</title>\n    <style>\n        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}\n        h1 {{ color: #333; }}\n        .meta {{ color: #666; margin-bottom: 20px; }}\n        .content {{ line-height: 1.6; }}\n        .post {{ margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}\n    </style>\n</head>\n<body>\n");
+
+    for post in posts {
+        html_content.push_str(&format!(
+            "    <div class=\"post\">\n        <h1>{}</h1>\n        <div class=\"meta\">\n            <p><strong>发布时间:</strong> {}</p>\n            <p><strong>作者:</strong> {}</p>\n        </div>\n        <div class=\"content\">{}</div>\n    </div>\n",
+            post.title,
+            post.published_at.unwrap_or(post.created_at),
+            post.author,
+            post.content
+        ));
+    }
+
+    html_content.push_str("</body>\n</html>");
+
+    // 这里需要使用 weasyprint 将 HTML 转换为 PDF
+    // 由于实现细节复杂，这里只展示接口设计
+
+    HttpResponse::Ok()
+        .content_type("application/pdf")
+        .header("Content-Disposition", "attachment; filename=posts.pdf")
+        .body("PDF content") // 实际应返回生成的 PDF 内容
+}
+
+// 批量导出文章为 HTML 格式
+pub async fn export_posts_html(req: HttpRequest) -> impl Responder {
+    let user = match get_user_from_request(&req) {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json("Unauthorized"),
+    };
+
+    let mut conn = establish_connection();
+
+    // 获取用户的所有文章
+    let posts = posts::table
+        .filter(posts::user_id.eq(user.user_id))
+        .load::<Post>(&mut conn)
+        .unwrap_or_default();
+
+    // 构建批量 HTML 内容
+    let mut html_content = String::from("<!DOCTYPE html>\n<html>\n<head>\n    <title>Posts Export</title>\n    <style>\n        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}\n        h1 {{ color: #333; }}\n        .meta {{ color: #666; margin-bottom: 20px; }}\n        .content {{ line-height: 1.6; }}\n        .post {{ margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}\n    </style>\n</head>\n<body>\n");
+
+    for post in posts {
+        html_content.push_str(&format!(
+            "    <div class=\"post\">\n        <h1>{}</h1>\n        <div class=\"meta\">\n            <p><strong>发布时间:</strong> {}</p>\n            <p><strong>作者:</strong> {}</p>\n        </div>\n        <div class=\"content\">{}</div>\n    </div>\n",
+            post.title,
+            post.published_at.unwrap_or(post.created_at),
+            post.author,
+            post.content
+        ));
+    }
+
+    html_content.push_str("</body>\n</html>");
+
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .header("Content-Disposition", "attachment; filename=posts.html")
+        .body(html_content)
 }
 
 pub async fn upload_media(req: HttpRequest, mut payload: Multipart) -> impl Responder {

@@ -228,6 +228,9 @@ pub struct Comment {
     pub author_email: Option<String>,
     pub author_website: Option<String>,
     pub status: String,
+    pub likes_count: i32,
+    pub sort_order: i32,
+    pub notification_sent: bool,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -324,4 +327,55 @@ pub struct ReadHistoryWithPost {
     pub read_at: chrono::NaiveDateTime,
     pub read_duration: Option<i32>,
     pub post: Post,
+}
+
+// 评论点赞模型
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct CommentLike {
+    pub id: i32,
+    pub comment_id: i32,
+    pub user_id: i32,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::comment_likes)]
+pub struct NewCommentLike {
+    pub comment_id: i32,
+    pub user_id: i32,
+}
+
+// 评论通知模型
+#[derive(Queryable, Serialize, Deserialize)]
+pub struct CommentNotification {
+    pub id: i32,
+    pub comment_id: i32,
+    pub user_id: i32,
+    pub notification_type: String,
+    pub is_read: bool,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::comment_notifications)]
+pub struct NewCommentNotification {
+    pub comment_id: i32,
+    pub user_id: i32,
+    pub notification_type: String,
+}
+
+// 通知查询参数
+#[derive(Deserialize)]
+pub struct NotificationQuery {
+    pub unread_only: Option<bool>,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+// 评论查询参数
+#[derive(Deserialize)]
+pub struct CommentQuery {
+    pub sort: Option<String>,
+    pub page: Option<i32>,
+    pub per_page: Option<i32>,
 }
